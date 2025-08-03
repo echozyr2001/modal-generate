@@ -1,0 +1,9 @@
+transformers
+diffusers
+torch
+accelerate
+pydantic
+pydantic-settings
+boto3
+tenacity
+fastapi[standard]
