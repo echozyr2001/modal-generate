@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
 import re
@@ -15,7 +15,8 @@ class AudioGenerationBase(BaseModel):
 class GenerateFromDescriptionRequest(AudioGenerationBase):
     full_described_song: str = Field(..., max_length=1000)
     
-    @validator('full_described_song')
+    @field_validator('full_described_song')
+    @classmethod
     def validate_description(cls, v):
         cleaned = re.sub(r'[<>"\']', '', v.strip())
         if len(cleaned) < 5:
@@ -47,7 +48,8 @@ class GenerateMusicResponse(BaseModel):
 class LyricsGenerationRequest(BaseModel):
     description: str = Field(..., max_length=1000)
     
-    @validator('description')
+    @field_validator('description')
+    @classmethod
     def validate_description(cls, v):
         cleaned = re.sub(r'[<>"\']', '', v.strip())
         if len(cleaned) < 5:
@@ -62,7 +64,8 @@ class LyricsGenerationResponse(BaseModel):
 class PromptGenerationRequest(BaseModel):
     description: str = Field(..., max_length=1000)
     
-    @validator('description')
+    @field_validator('description')
+    @classmethod
     def validate_description(cls, v):
         cleaned = re.sub(r'[<>"\']', '', v.strip())
         if len(cleaned) < 5:
@@ -75,8 +78,44 @@ class PromptGenerationResponse(BaseModel):
 
 
 class CoverImageGenerationRequest(BaseModel):
-    prompt: str = Field(..., max_length=500)
-    style: Optional[str] = Field(default="album cover art", max_length=100)
+    prompt: str = Field(..., min_length=5, max_length=500, description="Description for cover image generation")
+    style: Optional[str] = Field(default="album cover art", max_length=100, description="Style preset or custom style")
+    width: Optional[int] = Field(default=512, ge=256, le=1024, description="Image width (must be multiple of 64)")
+    height: Optional[int] = Field(default=512, ge=256, le=1024, description="Image height (must be multiple of 64)")
+    num_inference_steps: Optional[int] = Field(default=4, ge=1, le=10, description="Number of inference steps (1-10 for SDXL-Turbo)")
+    seed: Optional[int] = Field(default=None, ge=0, le=2**32-1, description="Random seed for reproducible generation")
+    
+    @field_validator('prompt')
+    @classmethod
+    def validate_prompt(cls, v):
+        # Remove potentially harmful characters and clean text
+        cleaned = re.sub(r'[<>"\']', '', v.strip())
+        if len(cleaned) < 5:
+            raise ValueError("Prompt too short after cleaning")
+        
+        # Check for inappropriate content keywords (basic filter)
+        inappropriate_keywords = ['nsfw', 'explicit', 'nude', 'sexual']
+        if any(keyword in cleaned.lower() for keyword in inappropriate_keywords):
+            raise ValueError("Prompt contains inappropriate content")
+        
+        return cleaned
+    
+    @field_validator('style')
+    @classmethod
+    def validate_style(cls, v):
+        if v is not None:
+            cleaned = re.sub(r'[<>"\']', '', v.strip())
+            return cleaned if cleaned else "album cover art"
+        return "album cover art"
+    
+    @field_validator('width', 'height')
+    @classmethod
+    def validate_dimensions(cls, v):
+        # Ensure dimensions are multiples of 64 for optimal generation
+        if v % 64 != 0:
+            # Round to nearest multiple of 64
+            v = round(v / 64) * 64
+        return max(256, min(1024, v))  # Clamp to valid range
 
 
 class CoverImageGenerationResponse(BaseModel):
@@ -165,7 +204,8 @@ class LyricsGenerationRequestEnhanced(BaseModel):
     language: Optional[str] = Field(default="english", max_length=50, description="Language for lyrics")
     mood: Optional[str] = Field(default=None, max_length=100, description="Mood or emotion for lyrics")
     
-    @validator('description')
+    @field_validator('description')
+    @classmethod
     def validate_description(cls, v):
         # Remove potentially harmful characters
         cleaned = re.sub(r'[<>"\']', '', v.strip())
@@ -173,7 +213,8 @@ class LyricsGenerationRequestEnhanced(BaseModel):
             raise ValueError("Description too short after cleaning")
         return cleaned
     
-    @validator('style', 'mood')
+    @field_validator('style', 'mood')
+    @classmethod
     def validate_optional_fields(cls, v):
         if v is not None:
             cleaned = re.sub(r'[<>"\']', '', v.strip())
@@ -187,14 +228,16 @@ class PromptGenerationRequestEnhanced(BaseModel):
     instruments: Optional[List[str]] = Field(default=None, description="Preferred instruments")
     tempo: Optional[str] = Field(default=None, max_length=50, description="Tempo specification")
     
-    @validator('description')
+    @field_validator('description')
+    @classmethod
     def validate_description(cls, v):
         cleaned = re.sub(r'[<>"\']', '', v.strip())
         if len(cleaned) < 5:
             raise ValueError("Description too short after cleaning")
         return cleaned
     
-    @validator('instruments')
+    @field_validator('instruments')
+    @classmethod
     def validate_instruments(cls, v):
         if v is not None:
             # Limit number of instruments and clean each one
@@ -212,7 +255,8 @@ class CategoryGenerationRequestEnhanced(BaseModel):
     max_categories: int = Field(default=5, ge=1, le=10, description="Maximum number of categories to generate")
     include_subgenres: bool = Field(default=True, description="Whether to include subgenres")
     
-    @validator('description')
+    @field_validator('description')
+    @classmethod
     def validate_description(cls, v):
         cleaned = re.sub(r'[<>"\']', '', v.strip())
         if len(cleaned) < 5:

@@ -108,5 +108,5 @@ model_volumes = {
 # Secrets for external services
 secrets = {
     "music_gen": modal.Secret.from_name("music-gen-secret"),
-    "aws_credentials": modal.Secret.from_name("aws-credentials", create_if_missing=True)
+    "aws_credentials": modal.Secret.from_name("aws-credentials")
 }
