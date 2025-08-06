@@ -4,8 +4,12 @@ import uuid
 import logging
 import shutil
 import time
-from typing import Optional, Dict, Any
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential
+from fastapi import HTTPException
+from fastapi.responses import FileResponse
 from shared.config import settings
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,10 @@ class FileManager:
             # Ensure local storage directory exists with proper structure
             self._setup_local_storage()
             logger.info(f"Using local storage: {self.local_storage_dir}")
+        
+        # Initialize metadata tracking
+        self.metadata_file = os.path.join(self.local_storage_dir, "metadata.json")
+        self._load_metadata()
     
     def _setup_local_storage(self):
         """Setup structured local storage directories"""
@@ -35,6 +43,45 @@ class FileManager:
         for subdir in subdirs:
             dir_path = os.path.join(self.local_storage_dir, subdir)
             os.makedirs(dir_path, exist_ok=True)
+    
+    def _load_metadata(self):
+        """Load file metadata from disk"""
+        try:
+            if os.path.exists(self.metadata_file):
+                with open(self.metadata_file, 'r') as f:
+                    self.metadata = json.load(f)
+            else:
+                self.metadata = {}
+        except Exception as e:
+            logger.warning(f"Failed to load metadata: {e}")
+            self.metadata = {}
+    
+    def _save_metadata(self):
+        """Save file metadata to disk"""
+        try:
+            with open(self.metadata_file, 'w') as f:
+                json.dump(self.metadata, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save metadata: {e}")
+    
+    def _add_file_metadata(self, key: str, original_path: str, file_type: str, file_size: int):
+        """Add metadata for a file"""
+        self.metadata[key] = {
+            "original_path": original_path,
+            "file_type": file_type,
+            "file_size": file_size,
+            "created_at": datetime.now().isoformat(),
+            "access_count": 0,
+            "last_accessed": None
+        }
+        self._save_metadata()
+    
+    def _update_access_metadata(self, key: str):
+        """Update access metadata for a file"""
+        if key in self.metadata:
+            self.metadata[key]["access_count"] += 1
+            self.metadata[key]["last_accessed"] = datetime.now().isoformat()
+            self._save_metadata()
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def save_file(self, file_path: str, file_key: Optional[str] = None, file_type: str = "temp") -> str:
@@ -52,19 +99,28 @@ class FileManager:
             file_extension = os.path.splitext(file_path)[1]
             file_key = f"{file_type}/{uuid.uuid4()}{file_extension}"
         
+        # Get file size for metadata
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        
         try:
             if self.use_s3:
                 # Upload to S3
                 self.s3_client.upload_file(file_path, self.bucket_name, file_key)
                 logger.info(f"Successfully uploaded {file_path} to s3://{self.bucket_name}/{file_key}")
-                return file_key
+                result_key = file_key
             else:
                 # Save to local with organized structure
                 local_path = os.path.join(self.local_storage_dir, file_key)
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 shutil.copy2(file_path, local_path)
                 logger.info(f"Successfully saved {file_path} to {local_path}")
-                return local_path
+                result_key = local_path
+            
+            # Add metadata tracking for local storage
+            if not self.use_s3:
+                self._add_file_metadata(result_key, file_path, file_type, file_size)
+            
+            return result_key
         except Exception as e:
             logger.error(f"Failed to save {file_path}: {e}")
             raise
@@ -88,7 +144,9 @@ class FileManager:
         Returns:
             Accessible URL or file path
         """
+        # Update access metadata for local storage
         if not self.use_s3:
+            self._update_access_metadata(key)
             # For local storage, return the file path
             if os.path.isabs(key):
                 return key
@@ -152,6 +210,160 @@ class FileManager:
         except Exception as e:
             logger.error(f"Failed to get file size for {key}: {e}")
             return None
+    
+    def serve_file(self, key: str) -> FileResponse:
+        """Serve file for local storage mode
+        
+        Args:
+            key: File key (local path)
+            
+        Returns:
+            FastAPI FileResponse
+        """
+        if self.use_s3:
+            raise HTTPException(
+                status_code=400, 
+                detail="File serving is only available for local storage mode"
+            )
+        
+        file_path = key if os.path.isabs(key) else os.path.join(self.local_storage_dir, key)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Update access metadata
+        self._update_access_metadata(key)
+        
+        # Determine media type based on file extension
+        media_type = self._get_media_type(file_path)
+        
+        return FileResponse(
+            path=file_path,
+            media_type=media_type,
+            filename=os.path.basename(file_path)
+        )
+    
+    def _get_media_type(self, file_path: str) -> str:
+        """Get media type based on file extension"""
+        extension = os.path.splitext(file_path)[1].lower()
+        media_types = {
+            '.wav': 'audio/wav',
+            '.mp3': 'audio/mpeg',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.txt': 'text/plain',
+            '.json': 'application/json'
+        }
+        return media_types.get(extension, 'application/octet-stream')
+    
+    def get_file_metadata(self, key: str) -> Optional[Dict[str, Any]]:
+        """Get metadata for a file"""
+        return self.metadata.get(key)
+    
+    def list_files(self, file_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List files with metadata
+        
+        Args:
+            file_type: Optional filter by file type (audio, images, temp)
+            
+        Returns:
+            List of file metadata dictionaries
+        """
+        files = []
+        for key, metadata in self.metadata.items():
+            if file_type is None or metadata.get("file_type") == file_type:
+                files.append({
+                    "key": key,
+                    **metadata
+                })
+        return files
+    
+    def cleanup_old_files(self, max_age_days: int = 7) -> int:
+        """Clean up old files based on age
+        
+        Args:
+            max_age_days: Maximum age in days before cleanup
+            
+        Returns:
+            Number of files cleaned up
+        """
+        if self.use_s3:
+            logger.warning("Cleanup not implemented for S3 storage")
+            return 0
+        
+        cleaned_count = 0
+        cutoff_time = datetime.now().timestamp() - (max_age_days * 24 * 3600)
+        
+        files_to_remove = []
+        for key, metadata in self.metadata.items():
+            try:
+                created_at = datetime.fromisoformat(metadata["created_at"]).timestamp()
+                if created_at < cutoff_time:
+                    files_to_remove.append(key)
+            except Exception as e:
+                logger.warning(f"Failed to parse creation time for {key}: {e}")
+        
+        for key in files_to_remove:
+            if self.delete_file(key):
+                cleaned_count += 1
+                self.metadata.pop(key, None)
+        
+        if cleaned_count > 0:
+            self._save_metadata()
+            logger.info(f"Cleaned up {cleaned_count} old files")
+        
+        return cleaned_count
+    
+    def cleanup_unused_files(self, min_access_count: int = 0) -> int:
+        """Clean up files that haven't been accessed
+        
+        Args:
+            min_access_count: Minimum access count to keep file
+            
+        Returns:
+            Number of files cleaned up
+        """
+        if self.use_s3:
+            logger.warning("Cleanup not implemented for S3 storage")
+            return 0
+        
+        cleaned_count = 0
+        files_to_remove = []
+        
+        for key, metadata in self.metadata.items():
+            if metadata.get("access_count", 0) <= min_access_count:
+                files_to_remove.append(key)
+        
+        for key in files_to_remove:
+            if self.delete_file(key):
+                cleaned_count += 1
+                self.metadata.pop(key, None)
+        
+        if cleaned_count > 0:
+            self._save_metadata()
+            logger.info(f"Cleaned up {cleaned_count} unused files")
+        
+        return cleaned_count
+    
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Get storage statistics"""
+        stats = {
+            "storage_mode": "S3" if self.use_s3 else "local",
+            "total_files": len(self.metadata),
+            "file_types": {},
+            "total_size_bytes": 0,
+            "total_access_count": 0
+        }
+        
+        for metadata in self.metadata.values():
+            file_type = metadata.get("file_type", "unknown")
+            stats["file_types"][file_type] = stats["file_types"].get(file_type, 0) + 1
+            stats["total_size_bytes"] += metadata.get("file_size", 0)
+            stats["total_access_count"] += metadata.get("access_count", 0)
+        
+        return stats
 
 
 # 为了向后兼容，保留S3Manager类

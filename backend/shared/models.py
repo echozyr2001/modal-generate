@@ -44,6 +44,18 @@ class GenerateMusicResponse(BaseModel):
     audio_data: str
 
 
+class GenerateMusicResponseUnified(BaseModel):
+    """Unified response model that works with both S3 and local storage"""
+    audio_file_path: str  # S3 key or local path
+    cover_image_file_path: Optional[str] = None  # S3 key or local path
+    categories: List[str] = []
+    storage_mode: str = "local"  # "S3" or "local"
+    generation_metadata: Optional[Dict[str, Any]] = None
+    service_status: Optional[Dict[str, bool]] = None  # Track which services succeeded
+    errors: Optional[List[str]] = None  # Track any errors that occurred
+    correlation_id: Optional[str] = None
+
+
 # 独立服务的请求/响应模型
 class LyricsGenerationRequest(BaseModel):
     description: str = Field(..., max_length=1000)

@@ -22,6 +22,7 @@ from shared.utils import (
     cost_monitor,
     timeout_manager
 )
+from shared.file_serving import create_file_serving_router
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,23 @@ Living on the edge, never succumb.""",
             "model_loaded": hasattr(self, 'music_model'),
             "storage_mode": "S3" if self.file_manager.use_s3 else "local"
         }
+    
+    @modal.fastapi_endpoint(method="GET")
+    def serve_file(self, file_key: str):
+        """Serve audio file for local storage mode"""
+        if self.file_manager.use_s3:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400, 
+                detail="File serving is only available for local storage mode. Use S3 URLs for S3 storage."
+            )
+        
+        return self.file_manager.serve_file(file_key)
+    
+    @modal.fastapi_endpoint(method="GET")
+    def get_storage_stats(self) -> dict:
+        """Get storage statistics for this service"""
+        return self.file_manager.get_storage_stats()
 
 
 @app.local_entrypoint()

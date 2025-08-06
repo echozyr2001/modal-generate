@@ -15,6 +15,7 @@ from shared.models import (
 from shared.modal_images import image_generation_image, model_volumes, secrets
 from shared.service_base import ImageGenerationService
 from shared.utils import FileManager
+from shared.file_serving import create_file_serving_router
 from shared.config import settings
 
 logger = logging.getLogger(__name__)
@@ -428,6 +429,23 @@ class CoverImageGenServer(ImageGenerationService):
             "custom_style_supported": True,
             "style_mixing_supported": True
         }
+    
+    @modal.fastapi_endpoint(method="GET")
+    def serve_file(self, file_key: str):
+        """Serve image file for local storage mode"""
+        if self.file_manager.use_s3:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400, 
+                detail="File serving is only available for local storage mode. Use S3 URLs for S3 storage."
+            )
+        
+        return self.file_manager.serve_file(file_key)
+    
+    @modal.fastapi_endpoint(method="GET")
+    def get_storage_stats(self) -> dict:
+        """Get storage statistics for this service"""
+        return self.file_manager.get_storage_stats()
 
 
 @app.local_entrypoint()

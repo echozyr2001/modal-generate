@@ -77,6 +77,25 @@ class Settings(BaseSettings):
     
     class Config:
         env_file = ".env"
+    
+    def switch_to_local_storage(self, local_dir: str = "./outputs"):
+        """Switch to local storage mode"""
+        self.use_s3_storage = False
+        self.local_storage_dir = local_dir
+        
+    def switch_to_s3_storage(self, bucket_name: str):
+        """Switch to S3 storage mode"""
+        self.use_s3_storage = True
+        self.s3_bucket_name = bucket_name
+        
+    def get_storage_config(self) -> dict:
+        """Get current storage configuration"""
+        return {
+            "use_s3_storage": self.use_s3_storage,
+            "s3_bucket_name": self.s3_bucket_name if self.use_s3_storage else None,
+            "local_storage_dir": self.local_storage_dir if not self.use_s3_storage else None,
+            "storage_mode": "S3" if self.use_s3_storage else "local"
+        }
 
 
 settings = Settings()

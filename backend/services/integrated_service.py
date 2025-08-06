@@ -9,6 +9,7 @@ from shared.models import (
     GenerateWithCustomLyricsRequest,
     GenerateWithDescribedLyricsRequest,
     GenerateMusicResponseS3,
+    GenerateMusicResponseUnified,
     ServiceConfig,
     GPUType,
     GenerationMetadata
@@ -30,15 +31,7 @@ logger = logging.getLogger(__name__)
 app = modal.App("music-generator-integrated")
 
 
-class GenerateMusicResponseUnified(BaseModel):
-    """Unified response model with partial result handling"""
-    audio_file_path: str
-    cover_image_file_path: Optional[str] = None
-    categories: List[str] = []
-    generation_metadata: Dict[str, Any] = {}
-    service_status: Dict[str, bool] = {}  # Track which services succeeded
-    errors: List[str] = []  # Track any errors that occurred
-    correlation_id: str
+
 
 
 @app.cls(
