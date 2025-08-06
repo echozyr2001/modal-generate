@@ -158,19 +158,87 @@ class GenerationMetadata(BaseModel):
     operation_id: str = Field(..., description="Unique operation identifier")
 
 
+# Enhanced Request Models with Comprehensive Validation
+class LyricsGenerationRequestEnhanced(BaseModel):
+    description: str = Field(..., min_length=5, max_length=1000, description="Description for lyrics generation")
+    style: Optional[str] = Field(default=None, max_length=100, description="Optional style specification")
+    language: Optional[str] = Field(default="english", max_length=50, description="Language for lyrics")
+    mood: Optional[str] = Field(default=None, max_length=100, description="Mood or emotion for lyrics")
+    
+    @validator('description')
+    def validate_description(cls, v):
+        # Remove potentially harmful characters
+        cleaned = re.sub(r'[<>"\']', '', v.strip())
+        if len(cleaned) < 5:
+            raise ValueError("Description too short after cleaning")
+        return cleaned
+    
+    @validator('style', 'mood')
+    def validate_optional_fields(cls, v):
+        if v is not None:
+            cleaned = re.sub(r'[<>"\']', '', v.strip())
+            return cleaned if cleaned else None
+        return v
+
+
+class PromptGenerationRequestEnhanced(BaseModel):
+    description: str = Field(..., min_length=5, max_length=1000, description="Description for prompt generation")
+    genre: Optional[str] = Field(default=None, max_length=100, description="Musical genre")
+    instruments: Optional[List[str]] = Field(default=None, description="Preferred instruments")
+    tempo: Optional[str] = Field(default=None, max_length=50, description="Tempo specification")
+    
+    @validator('description')
+    def validate_description(cls, v):
+        cleaned = re.sub(r'[<>"\']', '', v.strip())
+        if len(cleaned) < 5:
+            raise ValueError("Description too short after cleaning")
+        return cleaned
+    
+    @validator('instruments')
+    def validate_instruments(cls, v):
+        if v is not None:
+            # Limit number of instruments and clean each one
+            cleaned_instruments = []
+            for instrument in v[:10]:  # Max 10 instruments
+                cleaned = re.sub(r'[<>"\']', '', instrument.strip())
+                if cleaned:
+                    cleaned_instruments.append(cleaned)
+            return cleaned_instruments if cleaned_instruments else None
+        return v
+
+
+class CategoryGenerationRequestEnhanced(BaseModel):
+    description: str = Field(..., min_length=5, max_length=1000, description="Description for category generation")
+    max_categories: int = Field(default=5, ge=1, le=10, description="Maximum number of categories to generate")
+    include_subgenres: bool = Field(default=True, description="Whether to include subgenres")
+    
+    @validator('description')
+    def validate_description(cls, v):
+        cleaned = re.sub(r'[<>"\']', '', v.strip())
+        if len(cleaned) < 5:
+            raise ValueError("Description too short after cleaning")
+        return cleaned
+
+
 # Enhanced Response Models with Metadata
 class LyricsGenerationResponseEnhanced(BaseModel):
-    lyrics: str
+    lyrics: str = Field(..., description="Generated lyrics")
+    word_count: int = Field(..., description="Number of words in lyrics")
+    structure_tags: List[str] = Field(default_factory=list, description="Structure tags found in lyrics")
     metadata: GenerationMetadata
 
 
 class PromptGenerationResponseEnhanced(BaseModel):
-    prompt: str
+    prompt: str = Field(..., description="Generated music prompt")
+    tag_count: int = Field(..., description="Number of tags in prompt")
+    detected_genre: Optional[str] = Field(default=None, description="Primary genre detected")
     metadata: GenerationMetadata
 
 
 class CategoryGenerationResponseEnhanced(BaseModel):
-    categories: List[str]
+    categories: List[str] = Field(..., description="Generated categories")
+    primary_genre: Optional[str] = Field(default=None, description="Primary genre identified")
+    confidence_scores: Optional[Dict[str, float]] = Field(default=None, description="Confidence scores for categories")
     metadata: GenerationMetadata
 
 
