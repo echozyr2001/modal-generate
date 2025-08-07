@@ -14,36 +14,38 @@ and GPU requirements as specified in requirements 2.1, 2.2, and 2.3.
 import modal
 from shared.config import settings
 
-# Base image with common dependencies
-base_image = (
+# Base image with common dependencies (without local sources)
+base_image_core = (
     modal.Image.debian_slim()
     .apt_install("git", "curl", "wget")
     .pip_install("pydantic", "pydantic-settings", "fastapi[standard]", "boto3", "tenacity")
     .env({"HF_HOME": settings.hf_cache_dir})
-    .add_local_python_source("shared")
 )
+
+# Base image with local sources added last
+base_image = base_image_core.add_local_python_source("shared")
 
 # Text generation image for lyrics, prompts, and categorization services
 # Optimized for CPU/low-cost GPU usage (Requirement 2.1)
 text_generation_image = (
-    base_image
+    base_image_core
     .pip_install(
         "transformers>=4.35.0",
         "torch>=2.0.0",
         "accelerate>=0.24.0",
         "tokenizers>=0.15.0"
     )
-    .add_local_python_source("prompts")
     .env({
-        "TRANSFORMERS_CACHE": "/.cache/huggingface/transformers",
         "HF_DATASETS_CACHE": "/.cache/huggingface/datasets"
     })
+    .add_local_python_source("shared")
+    .add_local_python_source("prompts")  # Add local sources last
 )
 
 # Music generation image with ACE-Step pipeline
 # Optimized for high-memory GPU instances (Requirement 2.3)
 music_generation_image = (
-    base_image
+    base_image_core
     .pip_install(
         "torch>=2.0.0",
         "torchaudio>=2.0.0",
@@ -61,12 +63,14 @@ music_generation_image = (
         "CUDA_VISIBLE_DEVICES": "0",
         "TORCH_CUDA_ARCH_LIST": "8.0;8.6;8.9;9.0"
     })
+    .add_local_python_source("shared")
+    .add_local_python_source("prompts")  # Add local sources last
 )
 
 # Image generation image with SDXL-Turbo
 # Optimized for mid-tier GPU instances (Requirement 2.2)
 image_generation_image = (
-    base_image
+    base_image_core
     .pip_install(
         "diffusers>=0.24.0",
         "torch>=2.0.0",
@@ -77,15 +81,15 @@ image_generation_image = (
         "safetensors>=0.4.0"
     )
     .env({
-        "DIFFUSERS_CACHE": "/.cache/huggingface/diffusers",
-        "TRANSFORMERS_CACHE": "/.cache/huggingface/transformers"
+        "DIFFUSERS_CACHE": "/.cache/huggingface/diffusers"
     })
+    .add_local_python_source("shared")  # Add local sources last
 )
 
 # Integration service image for orchestration
 # CPU-only, lightweight for service composition (Requirement 2.1)
 integration_service_image = (
-    base_image
+    base_image_core
     .pip_install(
         "httpx>=0.25.0",
         "aiohttp>=3.9.0",
@@ -96,6 +100,7 @@ integration_service_image = (
         "PYTHONUNBUFFERED": "1",
         "PYTHONPATH": "/root"
     })
+    .add_local_python_source("shared")  # Add local sources last
 )
 
 # Storage volumes for model caching

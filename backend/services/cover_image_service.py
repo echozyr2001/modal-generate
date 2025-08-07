@@ -12,10 +12,9 @@ from shared.models import (
     GPUType,
     GenerationMetadata
 )
-from shared.modal_images import image_generation_image, model_volumes, secrets
-from shared.service_base import ImageGenerationService
+from shared.modal_images import image_generation_image
+from shared.modal_config import hf_volume, music_gen_secrets
 from shared.utils import FileManager
-from shared.file_serving import create_file_serving_router
 from shared.config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,47 +26,85 @@ cover_image_config = ServiceConfig(
     scaledown_window=45,  # 45-second scaledown window
     max_runtime_seconds=120,  # 2 minutes max for image generation
     max_concurrent_requests=5,  # Reasonable limit for GPU service
-    memory_gb=16  # Sufficient for SDXL-Turbo
+    memory_gb=16,  # Sufficient for SDXL-Turbo
+    cost_per_hour=0.60  # L4 cost estimate
 )
 
 app = modal.App("cover-image-generator")
 
 
+class SimpleTimeoutManager:
+    """Simple timeout manager for operations"""
+    def __init__(self):
+        self.operations = {}
+    
+    def check_timeout(self, operation_id: str) -> bool:
+        """Check if operation has timed out"""
+        if operation_id in self.operations:
+            start_time = self.operations[operation_id]
+            elapsed = time.time() - start_time
+            return elapsed > cover_image_config.max_runtime_seconds
+        return False
+    
+    def start_timeout(self, operation_id: str):
+        """Start timeout tracking for operation"""
+        self.operations[operation_id] = time.time()
+    
+    def end_timeout(self, operation_id: str):
+        """End timeout tracking for operation"""
+        self.operations.pop(operation_id, None)
+    
+    def get_elapsed_time(self, operation_id: str) -> float:
+        """Get elapsed time for operation"""
+        if operation_id in self.operations:
+            return time.time() - self.operations[operation_id]
+        return 0.0
+
+
 @app.cls(
     image=image_generation_image,
     gpu=cover_image_config.gpu_type.value,
-    volumes={
-        "/.cache/huggingface": model_volumes["huggingface_cache"],
-        "/.cache/diffusers": model_volumes["diffusers_cache"]
-    },
-    secrets=[secrets["music_gen"], secrets["aws_credentials"]],
+    volumes={"/.cache/huggingface": hf_volume},
+    secrets=[music_gen_secrets],
     scaledown_window=cover_image_config.scaledown_window,
     timeout=cover_image_config.max_runtime_seconds
 )
-class CoverImageGenServer(ImageGenerationService):
-    def __init__(self):
-        # Initialize FileManager for storage handling
-        file_manager = FileManager(
-            use_s3=settings.use_s3_storage,
-            local_storage_dir=settings.local_storage_dir
-        )
-        super().__init__(cover_image_config, file_manager)
-        self.pipeline = None
-        self.model_id = "stabilityai/sdxl-turbo"  # SDXL-Turbo for fast generation
+class CoverImageGenServer:
+    # Remove custom __init__ to fix Modal deprecation warning
+    # Initialize these in load_model instead
 
     @modal.enter()
     def load_model(self):
         """Load SDXL-Turbo model optimized for fast image generation"""
         from diffusers import AutoPipelineForText2Image
+        import os
+        
+        # Initialize attributes that were previously in __init__
+        self.config = cover_image_config
+        self.pipeline = None
+        self.model_id = "stabilityai/sdxl-turbo"
+        self._model_loaded = False
+        
+        # Initialize FileManager for storage handling
+        # For testing, force local storage to save costs
+        settings.switch_to_local_storage("./outputs")
+        self.file_manager = FileManager(
+            use_s3=settings.use_s3_storage,
+            local_storage_dir=settings.local_storage_dir
+        )
+        
+        # Simple timeout manager
+        self.timeout_manager = SimpleTimeoutManager()
         
         logger.info(f"Loading image generation model: {self.model_id}")
+        logger.info(f"Storage mode: {'S3' if settings.use_s3_storage else 'Local'} ({settings.local_storage_dir})")
         
         try:
             self.pipeline = AutoPipelineForText2Image.from_pretrained(
                 self.model_id,
                 torch_dtype=torch.float16,
                 variant="fp16",
-                cache_dir="/.cache/diffusers"
+                cache_dir="/.cache/huggingface"
             )
             
             # Move to GPU if available
@@ -86,6 +123,7 @@ class CoverImageGenServer(ImageGenerationService):
             
         except Exception as e:
             logger.error(f"Failed to load image generation model: {e}")
+            self._model_loaded = False
             raise
 
     def generate(self, request: CoverImageGenerationRequest) -> dict:
@@ -134,7 +172,9 @@ class CoverImageGenServer(ImageGenerationService):
             generation_params["generator"] = generator
         
         try:
+            logger.info(f"Starting image generation with params: steps={generation_params['num_inference_steps']}, size={generation_params['width']}x{generation_params['height']}")
             image = self.pipeline(**generation_params).images[0]
+            logger.info("Image generation successful")
         except Exception as e:
             logger.error(f"Image generation failed with full parameters: {e}")
             # Fallback to simpler generation without negative prompt
@@ -149,6 +189,7 @@ class CoverImageGenServer(ImageGenerationService):
                 fallback_params["generator"] = generation_params.get("generator")
             
             try:
+                logger.info(f"Trying fallback generation with simplified params")
                 image = self.pipeline(**fallback_params).images[0]
                 logger.info("Fallback generation successful")
             except Exception as fallback_error:
@@ -176,6 +217,77 @@ class CoverImageGenServer(ImageGenerationService):
         width, height = image.size
         estimated_bytes = width * height * 4
         return round(estimated_bytes / (1024 * 1024), 2)
+    
+    def save_image(self, image: Image.Image, file_type: str = "cover_images") -> str:
+        """Save image using FileManager"""
+        import uuid
+        import os
+        
+        try:
+            # Create filename with UUID
+            filename = f"{uuid.uuid4()}.png"
+            
+            # Ensure output directory exists
+            storage_dir = getattr(self.file_manager, 'local_storage_dir', './outputs')
+            os.makedirs(storage_dir, exist_ok=True)
+            
+            # Save to local file
+            file_path = os.path.join(storage_dir, filename)
+            image.save(file_path, "PNG")
+            
+            # Verify file was saved
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                logger.info(f"Image saved successfully to: {file_path} ({file_size} bytes)")
+            else:
+                logger.error(f"File was not saved properly: {file_path}")
+                raise RuntimeError("Failed to save image file")
+            
+            return file_path
+            
+        except Exception as e:
+            logger.error(f"Failed to save image: {e}")
+            raise RuntimeError(f"Image save failed: {e}")
+    
+    def operation_context(self, operation_type: str):
+        """Simple operation context manager"""
+        import uuid
+        from contextlib import contextmanager
+        
+        @contextmanager
+        def context():
+            operation_id = str(uuid.uuid4())
+            logger.info(f"Starting operation: {operation_type} ({operation_id})")
+            
+            # Start timeout tracking
+            if hasattr(self, 'timeout_manager'):
+                self.timeout_manager.start_timeout(operation_id)
+            
+            try:
+                yield operation_id
+            finally:
+                # End timeout tracking
+                if hasattr(self, 'timeout_manager'):
+                    elapsed = self.timeout_manager.get_elapsed_time(operation_id)
+                    self.timeout_manager.end_timeout(operation_id)
+                    logger.info(f"Completed operation: {operation_type} ({operation_id}) in {elapsed:.2f}s")
+                else:
+                    logger.info(f"Completed operation: {operation_type} ({operation_id})")
+        
+        return context()
+    
+    def create_metadata(self, operation_id: str, model_info: str, start_time: float) -> GenerationMetadata:
+        """Create metadata for enhanced responses"""
+        generation_time = time.time() - start_time
+        estimated_cost = generation_time * (cover_image_config.cost_per_hour / 3600) if hasattr(cover_image_config, 'cost_per_hour') else 0.0
+        
+        return GenerationMetadata(
+            operation_id=operation_id,
+            model_info=model_info,
+            generation_time=generation_time,
+            estimated_cost=estimated_cost,
+            gpu_type=cover_image_config.gpu_type.value
+        )
 
     @modal.fastapi_endpoint(method="POST")
     def generate_cover_image(self, request: CoverImageGenerationRequest) -> CoverImageGenerationResponseEnhanced:
@@ -262,24 +374,27 @@ class CoverImageGenServer(ImageGenerationService):
             raise ValueError("Too many inference steps: SDXL-Turbo works best with 1-10 steps")
     
     def _generate_with_timeout(self, request: CoverImageGenerationRequest, operation_id: str) -> dict:
-        """Generate image with timeout protection"""
-        import signal
+        """Generate image with simple timeout check"""
+        # Simple timeout check without signals (which don't work in thread pools)
+        start_time = time.time()
         
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"Generation timed out after {self.config.max_runtime_seconds} seconds")
-        
-        # Set up timeout signal (Unix systems only)
-        if hasattr(signal, 'SIGALRM'):
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(self.config.max_runtime_seconds)
+        # Check timeout before generation
+        if self.timeout_manager.check_timeout(operation_id):
+            raise TimeoutError(f"Operation {operation_id} timed out before generation")
         
         try:
             result = self.generate(request)
+            
+            # Check if generation took too long
+            generation_time = time.time() - start_time
+            if generation_time > self.config.max_runtime_seconds:
+                logger.warning(f"Generation took {generation_time:.2f}s, exceeding limit of {self.config.max_runtime_seconds}s")
+            
             return result
-        finally:
-            # Clear timeout signal
-            if hasattr(signal, 'SIGALRM'):
-                signal.alarm(0)
+        except Exception as e:
+            generation_time = time.time() - start_time
+            logger.error(f"Generation failed after {generation_time:.2f}s: {e}")
+            raise
 
     @modal.fastapi_endpoint(method="POST")
     def generate_cover_image_batch(self, requests: list[CoverImageGenerationRequest]) -> dict:
@@ -368,23 +483,35 @@ class CoverImageGenServer(ImageGenerationService):
     @modal.fastapi_endpoint(method="GET")
     def health_check(self) -> dict:
         """Health check endpoint"""
-        return super().health_check()
+        return {
+            "status": "healthy",
+            "service": cover_image_config.service_name,
+            "model_loaded": getattr(self, '_model_loaded', False),
+            "gpu_type": cover_image_config.gpu_type.value,
+            "scaledown_window": cover_image_config.scaledown_window,
+            "max_runtime": cover_image_config.max_runtime_seconds,
+            "timestamp": time.time()
+        }
 
     @modal.fastapi_endpoint(method="GET")
     def service_info(self) -> dict:
         """Get service information"""
-        info = super().get_service_info()
-        info.update({
-            "model_id": self.model_id,
+        return {
+            "service_name": cover_image_config.service_name,
+            "gpu_type": cover_image_config.gpu_type.value,
+            "scaledown_window": cover_image_config.scaledown_window,
+            "max_runtime": cover_image_config.max_runtime_seconds,
+            "model_id": getattr(self, 'model_id', 'stabilityai/sdxl-turbo'),
             "supported_styles": [
                 "album cover art", "vintage", "modern", "abstract", 
                 "photorealistic", "illustration", "grunge", "electronic"
             ],
             "image_resolution": "512x512",
             "supported_formats": ["PNG"],
-            "batch_limit": 10
-        })
-        return info
+            "batch_limit": 10,
+            "storage_mode": "Local" if not settings.use_s3_storage else "S3",
+            "storage_path": settings.local_storage_dir if not settings.use_s3_storage else settings.s3_bucket_name
+        }
 
     @modal.fastapi_endpoint(method="GET")
     def get_available_styles(self) -> dict:
@@ -433,108 +560,244 @@ class CoverImageGenServer(ImageGenerationService):
     @modal.fastapi_endpoint(method="GET")
     def serve_file(self, file_key: str):
         """Serve image file for local storage mode"""
-        if self.file_manager.use_s3:
+        if settings.use_s3_storage:
             from fastapi import HTTPException
             raise HTTPException(
                 status_code=400, 
                 detail="File serving is only available for local storage mode. Use S3 URLs for S3 storage."
             )
         
-        return self.file_manager.serve_file(file_key)
+        # Simple file serving for local mode
+        import os
+        from fastapi import HTTPException
+        from fastapi.responses import FileResponse
+        
+        file_path = os.path.join(settings.local_storage_dir, file_key)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        return FileResponse(file_path)
+    
+    @modal.fastapi_endpoint(method="GET")
+    def download_image(self, file_key: str) -> dict:
+        """Download image as base64 data (similar to audio download in main.py)"""
+        import os
+        import base64
+        from fastapi import HTTPException
+        
+        # Find the file in the storage directory
+        storage_dir = getattr(self, 'file_manager', None)
+        if storage_dir and hasattr(storage_dir, 'local_storage_dir'):
+            storage_path = storage_dir.local_storage_dir
+        else:
+            storage_path = settings.local_storage_dir
+        
+        file_path = os.path.join(storage_path, file_key)
+        
+        # If file_key is a full path, use it directly
+        if not os.path.exists(file_path) and os.path.exists(file_key):
+            file_path = file_key
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {file_key}")
+        
+        try:
+            with open(file_path, "rb") as f:
+                image_bytes = f.read()
+            
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            file_size = len(image_bytes)
+            
+            return {
+                "image_data": image_b64,
+                "file_size": file_size,
+                "filename": os.path.basename(file_path),
+                "format": "PNG"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to read image file {file_path}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to read image: {e}")
     
     @modal.fastapi_endpoint(method="GET")
     def get_storage_stats(self) -> dict:
         """Get storage statistics for this service"""
-        return self.file_manager.get_storage_stats()
+        import os
+        
+        if settings.use_s3_storage:
+            return {"storage_mode": "S3", "bucket": settings.s3_bucket_name}
+        
+        # Local storage stats
+        storage_dir = settings.local_storage_dir
+        if not os.path.exists(storage_dir):
+            return {"storage_mode": "Local", "directory": storage_dir, "files": 0, "total_size_mb": 0}
+        
+        files = [f for f in os.listdir(storage_dir) if f.endswith('.png')]
+        total_size = sum(os.path.getsize(os.path.join(storage_dir, f)) for f in files)
+        
+        return {
+            "storage_mode": "Local",
+            "directory": storage_dir,
+            "files": len(files),
+            "total_size_mb": round(total_size / (1024 * 1024), 2)
+        }
 
 
 @app.local_entrypoint()
 def test_cover_generation():
     """Test cover image generation service with comprehensive endpoint testing"""
     import requests
+    import time
+    import os
+    import base64
     
     server = CoverImageGenServer()
     
+    print("=== Cover Image Generation Service Test ===")
+    print(f"Configuration: {cover_image_config.service_name} on {cover_image_config.gpu_type.value}")
+    print(f"Scaledown window: {cover_image_config.scaledown_window}s")
+    print(f"Max runtime: {cover_image_config.max_runtime_seconds}s")
+    print(f"Storage mode: Local ({settings.local_storage_dir})")
+    print("-" * 50)
+    
+    # Wait for service to initialize
+    print("Waiting for service to initialize...")
+    time.sleep(5)
+    
     try:
+        # Test health check first
+        print("=== Testing Health Check ===")
+        health_url = server.health_check.get_web_url()
+        print(f"Health check URL: {health_url}")
+        health_response = requests.get(health_url, timeout=30)
+        health_response.raise_for_status()
+        health_data = health_response.json()
+        print(f"Health status: {health_data['status']}")
+        print(f"Model loaded: {health_data['model_loaded']}")
+        
+        if not health_data.get('model_loaded', False):
+            print("WARNING: Model not loaded yet, waiting...")
+            time.sleep(10)
+        
         # Test service info endpoint
-        print("=== Testing Service Info ===")
+        print("\n=== Testing Service Info ===")
         info_url = server.service_info.get_web_url()
-        info_response = requests.get(info_url)
+        info_response = requests.get(info_url, timeout=30)
         info_response.raise_for_status()
         service_info = info_response.json()
         print(f"Service: {service_info['service_name']}")
         print(f"GPU Type: {service_info['gpu_type']}")
-        print(f"Supported styles: {service_info['supported_styles']}")
+        print(f"Storage: {service_info['storage_mode']} ({service_info['storage_path']})")
+        print(f"Supported styles: {len(service_info['supported_styles'])} styles")
         
         # Test available styles endpoint
         print("\n=== Testing Available Styles ===")
         styles_url = server.get_available_styles.get_web_url()
-        styles_response = requests.get(styles_url)
+        styles_response = requests.get(styles_url, timeout=30)
         styles_response.raise_for_status()
         styles_data = styles_response.json()
         print(f"Available styles: {list(styles_data['available_styles'].keys())}")
         
         # Test single image generation with different styles
         print("\n=== Testing Single Image Generation ===")
-        test_styles = ["electronic", "vintage", "modern"]
-        
-        for style in test_styles:
-            request = CoverImageGenerationRequest(
-                prompt=f"{style} music album",
-                style=style
-            )
-            
-            endpoint_url = server.generate_cover_image.get_web_url()
-            response = requests.post(endpoint_url, json=request.model_dump())
-            response.raise_for_status()
-            cover_response = CoverImageGenerationResponseEnhanced(**response.json())
-            
-            print(f"Style '{style}':")
-            print(f"  File: {cover_response.file_path}")
-            print(f"  Dimensions: {cover_response.image_dimensions}")
-            print(f"  Size: {cover_response.file_size_mb}MB")
-            print(f"  Generation time: {cover_response.metadata.generation_time:.2f}s")
-            print(f"  Estimated cost: ${cover_response.metadata.estimated_cost:.4f}")
-        
-        # Test batch generation with enhanced response
-        print("\n=== Testing Batch Generation ===")
-        batch_requests = [
-            CoverImageGenerationRequest(prompt="rock music, electric guitar", style="grunge"),
-            CoverImageGenerationRequest(prompt="classical symphony", style="vintage"),
-            CoverImageGenerationRequest(prompt="ambient electronic", style="abstract"),
+        test_cases = [
+            ("electronic", "electronic music album cover"),
+            ("vintage", "vintage rock album"),
+            ("modern", "modern pop album")
         ]
         
-        batch_endpoint_url = server.generate_cover_image_batch.get_web_url()
-        response = requests.post(batch_endpoint_url, json=[req.model_dump() for req in batch_requests])
-        response.raise_for_status()
-        batch_result = response.json()
+        generated_files = []
         
-        stats = batch_result["batch_statistics"]
-        print(f"Batch Results:")
-        print(f"  Total requested: {stats['total_requested']}")
-        print(f"  Successful: {stats['successful_count']}")
-        print(f"  Failed: {stats['failed_count']}")
-        print(f"  Success rate: {stats['success_rate']:.1%}")
-        print(f"  Total batch time: {stats['total_batch_time']:.2f}s")
-        print(f"  Average generation time: {stats['average_generation_time']:.2f}s")
-        print(f"  Total file size: {stats['total_file_size_mb']:.2f}MB")
+        for style, prompt in test_cases:
+            try:
+                print(f"Generating {style} style image...")
+                request = CoverImageGenerationRequest(
+                    prompt=prompt,
+                    style=style,
+                    width=512,
+                    height=512,
+                    num_inference_steps=2  # Fast generation for testing
+                )
+                
+                endpoint_url = server.generate_cover_image.get_web_url()
+                response = requests.post(endpoint_url, json=request.model_dump(), timeout=120)
+                response.raise_for_status()
+                cover_response = CoverImageGenerationResponseEnhanced(**response.json())
+                
+                print(f"✓ Style '{style}' succeeded:")
+                print(f"  File: {cover_response.file_path}")
+                print(f"  Dimensions: {cover_response.image_dimensions}")
+                print(f"  Size: {cover_response.file_size_mb}MB")
+                print(f"  Generation time: {cover_response.metadata.generation_time:.2f}s")
+                print(f"  Estimated cost: ${cover_response.metadata.estimated_cost:.4f}")
+                
+                generated_files.append(cover_response.file_path)
+                
+            except requests.exceptions.Timeout:
+                print(f"✗ Style '{style}' timed out")
+            except Exception as e:
+                print(f"✗ Style '{style}' failed: {e}")
         
-        for i, img in enumerate(batch_result["successful_images"]):
-            print(f"  Image {i+1}: {img['file_path']} ({img['metadata']['generation_time']:.2f}s)")
-            
-        # Test health check
-        print("\n=== Testing Health Check ===")
-        health_url = server.health_check.get_web_url()
-        health_response = requests.get(health_url)
-        health_response.raise_for_status()
-        health_data = health_response.json()
-        print(f"Health status: {health_data['status']}")
-        print(f"Model loaded: {health_data['model_loaded']}")
+        # Test storage stats
+        print("\n=== Testing Storage Stats ===")
+        stats_url = server.get_storage_stats.get_web_url()
+        stats_response = requests.get(stats_url, timeout=30)
+        stats_response.raise_for_status()
+        storage_stats = stats_response.json()
+        print(f"Storage mode: {storage_stats['storage_mode']}")
+        print(f"Files generated: {storage_stats.get('files', 0)}")
+        print(f"Total size: {storage_stats.get('total_size_mb', 0)}MB")
         
-        print("\n=== All Tests Passed! ===")
+        # Download and save images locally (similar to main.py audio saving)
+        print("\n=== Downloading Images to Local Files ===")
+        local_files = []
+        
+        for i, file_path in enumerate(generated_files):
+            try:
+                # Extract filename from the service path
+                filename = os.path.basename(file_path)
+                local_filename = f"cover_image_{i+1}_{filename}"
+                
+                # Use the download_image endpoint to get base64 data
+                download_url = server.download_image.get_web_url()
+                download_response = requests.get(f"{download_url}?file_key={filename}", timeout=30)
+                download_response.raise_for_status()
+                
+                # Parse the JSON response and decode base64 data
+                download_data = download_response.json()
+                image_bytes = base64.b64decode(download_data["image_data"])
+                
+                # Save to local file (similar to main.py audio saving)
+                with open(local_filename, "wb") as f:
+                    f.write(image_bytes)
+                
+                file_size = len(image_bytes) / (1024 * 1024)
+                print(f"✓ Downloaded {local_filename} ({file_size:.2f}MB)")
+                local_files.append(local_filename)
+                
+            except Exception as e:
+                print(f"✗ Failed to download {file_path}: {e}")
+        
+        # Verify local files exist
+        print("\n=== Verifying Downloaded Files ===")
+        for local_file in local_files:
+            if os.path.exists(local_file):
+                file_size = os.path.getsize(local_file) / (1024 * 1024)
+                print(f"✓ {local_file} saved locally ({file_size:.2f}MB)")
+            else:
+                print(f"✗ {local_file} not found locally")
+        
+        print(f"\n=== Test Summary ===")
+        print(f"Generated {len(generated_files)} images successfully")
+        print(f"Downloaded {len(local_files)} images to local directory")
+        print(f"Service storage: {settings.local_storage_dir}")
+        print(f"Local files: {', '.join(local_files) if local_files else 'None'}")
+        print("All tests completed!")
         
     except Exception as e:
         print(f"Test failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 
