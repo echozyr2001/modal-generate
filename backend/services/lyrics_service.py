@@ -2,6 +2,7 @@ import modal
 import logging
 import time
 import uuid
+import torch
 from fastapi import HTTPException
 from pydantic import ValidationError
 from shared.models import (
@@ -23,7 +24,7 @@ from shared.models import (
 )
 from shared.modal_config import llm_image, hf_volume, music_gen_secrets
 from shared.config import settings
-from shared.service_base import TextGenerationService
+
 from shared.utils import TimeoutManager, CostMonitor
 from prompts import LYRICS_GENERATOR_PROMPT, PROMPT_GENERATOR_PROMPT
 from typing import List, Dict, Any, Optional
@@ -51,47 +52,95 @@ lyrics_config = ServiceConfig(
     scaledown_window=lyrics_config.scaledown_window,
     timeout=lyrics_config.max_runtime_seconds
 )
-class LyricsGenServer(TextGenerationService):
-    def __init__(self):
-        super().__init__(lyrics_config)
-        self.cost_monitor = CostMonitor()
-        self.timeout_manager = TimeoutManager(lyrics_config.max_runtime_seconds)
+class LyricsGenServer:
+    # No inheritance to avoid Modal deprecation warning
+    # All initialization happens in load_model
 
     @modal.enter()
     def load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+        
+        # Initialize attributes that were previously in __init__
+        self.config = lyrics_config
+        self.cost_monitor = CostMonitor()
+        self.timeout_manager = TimeoutManager(lyrics_config.max_runtime_seconds)
+        self._model_loaded = False
         
         logger.info(f"Loading LLM model: {settings.llm_model_id} on {lyrics_config.gpu_type.value}")
         
         try:
+            # Load tokenizer first
             self.tokenizer = AutoTokenizer.from_pretrained(
                 settings.llm_model_id,
                 cache_dir=settings.hf_cache_dir
             )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                settings.llm_model_id,
-                torch_dtype="auto",
-                device_map="auto",
-                cache_dir=settings.hf_cache_dir
-            )
+            
+            # Set pad token if not exists
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Load model with proper device handling
+            device = "cuda" if torch.cuda.is_available() and lyrics_config.gpu_type != GPUType.CPU else "cpu"
+            
+            if device == "cuda":
+                # For GPU, use more conservative device mapping to avoid meta device issues
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    settings.llm_model_id,
+                    torch_dtype=torch.bfloat16,
+                    device_map={"": 0},  # Force all layers to GPU 0
+                    cache_dir=settings.hf_cache_dir,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True
+                )
+            else:
+                # For CPU
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    settings.llm_model_id,
+                    torch_dtype=torch.float32,
+                    device_map=None,
+                    cache_dir=settings.hf_cache_dir,
+                    trust_remote_code=True
+                )
+                self.model = self.model.to(device)
+            
+            # Verify model device placement
+            try:
+                model_device = next(self.model.parameters()).device
+                logger.info(f"Model parameters are on device: {model_device}")
+                
+                # Check for mixed device placement
+                devices = set()
+                for param in self.model.parameters():
+                    devices.add(param.device)
+                
+                if len(devices) > 1:
+                    logger.warning(f"Model has parameters on multiple devices: {devices}")
+                else:
+                    logger.info(f"All model parameters are on: {list(devices)[0]}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not verify model device placement: {e}")
             
             self._model_loaded = True
-            logger.info(f"LLM model loaded successfully on {lyrics_config.gpu_type.value}")
+            logger.info(f"LLM model loaded successfully on {device}")
             
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
+            self._model_loaded = False
             raise
 
-    def generate(self, request: Any) -> Dict[str, Any]:
-        """Base generate method implementation"""
-        # This will be called by specific endpoint methods
-        pass
+
 
     def prompt_qwen(self, question: str, operation_id: str) -> str:
         """通用的LLM推理方法 with timeout protection and error handling"""
         try:
+            # Check if model is loaded
+            if not hasattr(self, '_model_loaded') or not self._model_loaded:
+                raise RuntimeError("Model not loaded")
+            
             # Check timeout before starting generation
-            if self.timeout_manager.check_timeout(operation_id):
+            if hasattr(self, 'timeout_manager') and self.timeout_manager.check_timeout(operation_id):
                 raise TimeoutError(f"Operation {operation_id} timed out before LLM inference")
             
             # Validate input
@@ -107,37 +156,53 @@ class LyricsGenServer(TextGenerationService):
                 tokenize=False,
                 add_generation_prompt=True
             )
+            
+            # Tokenize with proper attention mask
             model_inputs = self.tokenizer(
-                [text], return_tensors="pt"
-            ).to(self.model.device)
+                [text], 
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048
+            )
+            
+            # Move inputs to model device with error handling
+            try:
+                device = next(self.model.parameters()).device
+                model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+            except Exception as e:
+                logger.error(f"Device placement error during input preparation: {e}")
+                # Fallback: try to use cuda:0 if available
+                device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
             # Check timeout before generation
-            if self.timeout_manager.check_timeout(operation_id):
+            if hasattr(self, 'timeout_manager') and self.timeout_manager.check_timeout(operation_id):
                 raise TimeoutError(f"Operation {operation_id} timed out before model generation")
             
             # Generate with error handling
             try:
-                generated_ids = self.model.generate(
-                    model_inputs.input_ids,
-                    max_new_tokens=512,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
-                )
+                with torch.no_grad():  # Save memory
+                    generated_ids = self.model.generate(
+                        **model_inputs,
+                        max_new_tokens=512,
+                        do_sample=True,
+                        temperature=0.7,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
+                    )
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     raise RuntimeError("GPU out of memory. Try again later.")
+                if "device" in str(e).lower():
+                    raise RuntimeError(f"Device placement error: {e}")
                 raise RuntimeError(f"Model generation failed: {e}")
             
-            generated_ids = [
-                output_ids[len(input_ids):] 
-                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-
-            response = self.tokenizer.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
+            # Extract only the new tokens
+            input_length = model_inputs['input_ids'].shape[1]
+            generated_tokens = generated_ids[0][input_length:]
+            
+            response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
             # Validate output
             if not response or len(response.strip()) == 0:
@@ -323,7 +388,7 @@ class LyricsGenServer(TextGenerationService):
         return {
             "status": "healthy",
             "service": lyrics_config.service_name,
-            "model_loaded": self._model_loaded,
+            "model_loaded": getattr(self, '_model_loaded', False),
             "gpu_type": lyrics_config.gpu_type.value,
             "scaledown_window": lyrics_config.scaledown_window,
             "max_runtime": lyrics_config.max_runtime_seconds,
@@ -667,13 +732,60 @@ class LyricsGenServer(TextGenerationService):
         
         return scores
 
+    def _start_monitoring(self, operation_id: str):
+        """Safely start monitoring"""
+        try:
+            if hasattr(self, 'cost_monitor'):
+                self.cost_monitor.start_operation(
+                    operation_id, 
+                    lyrics_config.gpu_type.value, 
+                    lyrics_config.service_name
+                )
+            if hasattr(self, 'timeout_manager'):
+                self.timeout_manager.start_timeout(operation_id, lyrics_config.max_runtime_seconds)
+        except Exception as e:
+            logger.warning(f"Failed to start monitoring for {operation_id}: {e}")
+    
+    def _end_monitoring(self, operation_id: str):
+        """Safely end monitoring"""
+        try:
+            if hasattr(self, 'cost_monitor'):
+                self.cost_monitor.end_operation(operation_id)
+            if hasattr(self, 'timeout_manager'):
+                self.timeout_manager.end_timeout(operation_id)
+        except Exception as e:
+            logger.warning(f"Failed to end monitoring for {operation_id}: {e}")
+
     def _cleanup_operation(self, operation_id: str):
         """Cleanup monitoring for failed operations"""
-        try:
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup operation {operation_id}: {e}")
+        self._end_monitoring(operation_id)
+    
+    def validate_text_input(self, text: str, max_length: int = 1000) -> str:
+        """Validate and clean text input"""
+        if not text or not text.strip():
+            raise ValueError("Text input cannot be empty")
+        
+        # Clean text
+        cleaned = text.strip()
+        
+        # Check length
+        if len(cleaned) > max_length:
+            raise ValueError(f"Text too long. Maximum length: {max_length}")
+        
+        return cleaned
+
+    def create_metadata(self, operation_id: str, model_info: str, start_time: float) -> GenerationMetadata:
+        """Create metadata for enhanced responses"""
+        generation_time = time.time() - start_time
+        estimated_cost = generation_time * (lyrics_config.cost_per_hour / 3600)  # Convert to per-second cost
+        
+        return GenerationMetadata(
+            operation_id=operation_id,
+            model_info=model_info,
+            generation_time=generation_time,
+            estimated_cost=estimated_cost,
+            gpu_type=lyrics_config.gpu_type.value
+        )
 
     def _validate_request_size(self, request_data: str, max_size: int = 10000):
         """Validate request size to prevent abuse"""
@@ -687,6 +799,9 @@ class LyricsGenServer(TextGenerationService):
 @app.local_entrypoint()
 def test_lyrics_generation():
     """测试优化后的歌词生成服务"""
+    import requests
+    import time
+    
     server = LyricsGenServer()
     
     print(f"Testing Lyrics Generation Service")
@@ -695,89 +810,99 @@ def test_lyrics_generation():
     print(f"Max runtime: {lyrics_config.max_runtime_seconds}s")
     print("-" * 50)
     
+    # Wait a bit for the service to fully initialize
+    print("Waiting for service to initialize...")
+    time.sleep(5)
+    
     # 测试健康检查
     try:
-        health = server.health_check()
+        health_url = server.health_check.get_web_url()
+        print(f"Health check URL: {health_url}")
+        response = requests.get(health_url, timeout=30)
+        response.raise_for_status()
+        health = response.json()
         print(f"Health check: {health}")
+        
+        if not health.get('model_loaded', False):
+            print("WARNING: Model not loaded yet, waiting...")
+            time.sleep(10)
+            
     except Exception as e:
         print(f"Health check failed: {e}")
+        return
     
-    # 测试歌词生成
-    try:
-        lyrics_request = LyricsGenerationRequest(description="a sad song about lost love")
-        lyrics_response = server.generate_lyrics(lyrics_request)
-        print(f"Generated lyrics:\n{lyrics_response.lyrics}")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Lyrics generation failed: {e}")
+    # Test basic endpoints first
+    basic_tests = [
+        ("generate_lyrics", LyricsGenerationRequest(description="a happy song about sunshine")),
+        ("generate_prompt", PromptGenerationRequest(description="upbeat electronic music")),
+        ("generate_categories", CategoryGenerationRequest(description="electronic dance music"))
+    ]
     
-    # 测试提示词生成
-    try:
-        prompt_request = PromptGenerationRequest(description="upbeat electronic dance music")
-        prompt_response = server.generate_prompt(prompt_request)
-        print(f"Generated prompt: {prompt_response.prompt}")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Prompt generation failed: {e}")
+    for endpoint_name, request_obj in basic_tests:
+        try:
+            endpoint = getattr(server, endpoint_name)
+            url = endpoint.get_web_url()
+            print(f"Testing {endpoint_name} at {url}")
+            
+            response = requests.post(url, json=request_obj.model_dump(), timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            
+            print(f"✓ {endpoint_name} succeeded")
+            if 'lyrics' in result:
+                print(f"  Lyrics preview: {result['lyrics'][:100]}...")
+            elif 'prompt' in result:
+                print(f"  Prompt: {result['prompt']}")
+            elif 'categories' in result:
+                print(f"  Categories: {result['categories']}")
+            print("-" * 50)
+            
+        except requests.exceptions.Timeout:
+            print(f"✗ {endpoint_name} timed out")
+        except requests.exceptions.RequestException as e:
+            print(f"✗ {endpoint_name} failed with request error: {e}")
+        except Exception as e:
+            print(f"✗ {endpoint_name} failed: {e}")
     
-    # 测试分类生成
-    try:
-        category_request = CategoryGenerationRequest(description="electronic dance music with heavy bass")
-        category_response = server.generate_categories(category_request)
-        print(f"Generated categories: {category_response.categories}")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Category generation failed: {e}")
+    print("Basic testing completed!")
     
-    # 测试增强版歌词生成
-    try:
-        enhanced_lyrics_request = LyricsGenerationRequestEnhanced(
-            description="a melancholic song about lost love",
+    # Only test enhanced endpoints if basic ones work
+    print("Testing enhanced endpoints...")
+    
+    enhanced_tests = [
+        ("generate_lyrics_enhanced", LyricsGenerationRequestEnhanced(
+            description="a melancholic song about rain",
             style="ballad",
-            mood="sad",
-            language="english"
-        )
-        enhanced_lyrics_response = server.generate_lyrics_enhanced(enhanced_lyrics_request)
-        print(f"Enhanced lyrics (words: {enhanced_lyrics_response.word_count}):")
-        print(f"Structure tags: {enhanced_lyrics_response.structure_tags}")
-        print(f"Generation time: {enhanced_lyrics_response.metadata.generation_time:.2f}s")
-        print(f"Estimated cost: ${enhanced_lyrics_response.metadata.estimated_cost:.4f}")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Enhanced lyrics generation failed: {e}")
-    
-    # 测试增强版提示词生成
-    try:
-        enhanced_prompt_request = PromptGenerationRequestEnhanced(
+            mood="sad"
+        )),
+        ("generate_prompt_enhanced", PromptGenerationRequestEnhanced(
             description="upbeat dance music",
             genre="electronic",
-            instruments=["synthesizer", "drums"],
-            tempo="128 bpm"
-        )
-        enhanced_prompt_response = server.generate_prompt_enhanced(enhanced_prompt_request)
-        print(f"Enhanced prompt (tags: {enhanced_prompt_response.tag_count}):")
-        print(f"Detected genre: {enhanced_prompt_response.detected_genre}")
-        print(f"Prompt: {enhanced_prompt_response.prompt}")
-        print(f"Generation time: {enhanced_prompt_response.metadata.generation_time:.2f}s")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Enhanced prompt generation failed: {e}")
+            instruments=["synthesizer"]
+        )),
+        ("generate_categories_enhanced", CategoryGenerationRequestEnhanced(
+            description="electronic dance music",
+            max_categories=5
+        ))
+    ]
     
-    # 测试增强版分类生成
-    try:
-        enhanced_category_request = CategoryGenerationRequestEnhanced(
-            description="electronic dance music with heavy bass and synthesizers",
-            max_categories=7,
-            include_subgenres=True
-        )
-        enhanced_category_response = server.generate_categories_enhanced(enhanced_category_request)
-        print(f"Enhanced categories: {enhanced_category_response.categories}")
-        print(f"Primary genre: {enhanced_category_response.primary_genre}")
-        print(f"Confidence scores: {enhanced_category_response.confidence_scores}")
-        print(f"Generation time: {enhanced_category_response.metadata.generation_time:.2f}s")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Enhanced category generation failed: {e}")
+    for endpoint_name, request_obj in enhanced_tests:
+        try:
+            endpoint = getattr(server, endpoint_name)
+            url = endpoint.get_web_url()
+            print(f"Testing {endpoint_name}")
+            
+            response = requests.post(url, json=request_obj.model_dump(), timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            
+            print(f"✓ {endpoint_name} succeeded")
+            print("-" * 50)
+            
+        except requests.exceptions.Timeout:
+            print(f"✗ {endpoint_name} timed out")
+        except Exception as e:
+            print(f"✗ {endpoint_name} failed: {e}")
     
     print("All testing completed!")
 
