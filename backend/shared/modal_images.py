@@ -16,7 +16,7 @@ from shared.config import settings
 
 # Base image with common dependencies (without local sources)
 base_image_core = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim(python_version="3.10")  # Use Python 3.10 for better compatibility
     .apt_install("git", "curl", "wget")
     .pip_install("pydantic", "pydantic-settings", "fastapi[standard]", "boto3", "tenacity")
     .env({"HF_HOME": settings.hf_cache_dir})
