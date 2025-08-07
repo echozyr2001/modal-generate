@@ -13,7 +13,7 @@ from prompts import LYRICS_GENERATOR_PROMPT, PROMPT_GENERATOR_PROMPT
 app = modal.App("music-generator")
 
 image = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim(python_version="3.10")
     .apt_install("git")
     .pip_install_from_requirements("requirements.txt")
     .run_commands(["git clone https://github.com/ace-step/ACE-Step.git /tmp/ACE-Step", "cd /tmp/ACE-Step && pip install ."])
@@ -204,7 +204,7 @@ class MusicGenServer:
             categories=categories
         )
 
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
+    @modal.fastapi_endpoint(method="POST")
     def generate(self) -> GenerateMusicResponse:
         output_dir = "/tmp/outputs"
         os.makedirs(output_dir, exist_ok=True)
@@ -258,7 +258,7 @@ class MusicGenServer:
 @app.local_entrypoint()
 def main():
     server = MusicGenServer()
-    endpoint_url = server.generate_with_described_lyrics.get_web_url()
+    endpoint_url = server.generate.get_web_url()
 
     request_data = GenerateWithDescribedLyricsRequest(
         prompt="rave, funk, 140BPM, disco",
@@ -270,12 +270,12 @@ def main():
 
     response = requests.post(endpoint_url, json=payload)
     response.raise_for_status()
-    result = GenerateMusicResponseS3(**response.json())
+    result = GenerateMusicResponse(**response.json())
 
-    print(
-        f"Success: {result.s3_key} {result.cover_image_s3_key} {result.categories}")
+    # print(
+    #     f"Success: {result.s3_key} {result.cover_image_s3_key} {result.categories}")
 
-    # audio_bytes = base64.b64decode(result.audio_data)
-    # output_filename = "generated.wav"
-    # with open(output_filename, "wb") as f:
-    #     f.write(audio_bytes)
+    audio_bytes = base64.b64decode(result.audio_data)
+    output_filename = "generated.wav"
+    with open(output_filename, "wb") as f:
+        f.write(audio_bytes)
