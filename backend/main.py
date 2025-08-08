@@ -5,63 +5,23 @@ import modal
 import os
 import boto3
 
-from pydantic import BaseModel
 import requests
-
+from shared.models import (
+    AudioGenerationBase,
+    GenerateFromDescriptionRequest,
+    GenerateWithCustomLyricsRequest,
+    GenerateWithDescribedLyricsRequest,
+    GenerateMusicResponseS3,
+    GenerateMusicResponse
+)
+from shared.deployment import music_generation_image, model_volume, hf_volume, music_gen_secrets
 from prompts import LYRICS_GENERATOR_PROMPT, PROMPT_GENERATOR_PROMPT
 
 app = modal.App("music-generator")
 
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git")
-    .pip_install_from_requirements("requirements.txt")
-    .run_commands(["git clone https://github.com/ace-step/ACE-Step.git /tmp/ACE-Step", "cd /tmp/ACE-Step && pip install ."])
-    .env({"HF_HOME": "/.cache/huggingface"})
-    .add_local_python_source("prompts")
-)
-
-model_volume = modal.Volume.from_name(
-    "ace-step-models", create_if_missing=True)
-hf_volume = modal.Volume.from_name("qwen-hf-cache", create_if_missing=True)
-
-music_gen_secrets = modal.Secret.from_name("music-gen-secret")
-
-
-class AudioGenerationBase(BaseModel):
-    audio_duration: float = 180.0
-    seed: int = -1
-    guidance_scale: float = 15.0
-    infer_step: int = 60
-    instrumental: bool = False
-
-
-class GenerateFromDescriptionRequest(AudioGenerationBase):
-    full_described_song: str
-
-
-class GenerateWithCustomLyricsRequest(AudioGenerationBase):
-    prompt: str
-    lyrics: str
-
-
-class GenerateWithDescribedLyricsRequest(AudioGenerationBase):
-    prompt: str
-    described_lyrics: str
-
-
-class GenerateMusicResponseS3(BaseModel):
-    s3_key: str
-    cover_image_s3_key: str
-    categories: List[str]
-
-
-class GenerateMusicResponse(BaseModel):
-    audio_data: str
-
 
 @app.cls(
-    image=image,
+    image=music_generation_image,
     gpu="L40S",
     volumes={"/models": model_volume, "/.cache/huggingface": hf_volume},
     secrets=[music_gen_secrets],
@@ -153,7 +113,7 @@ class MusicGenServer:
             lyrics: str,
             instrumental: bool,
             audio_duration: float,
-            infer_step: int,
+            inference_steps: int,
             guidance_scale: float,
             seed: int,
             description_for_categorization: str
@@ -173,7 +133,7 @@ class MusicGenServer:
             prompt=prompt,
             lyrics=final_lyrics,
             audio_duration=audio_duration,
-            infer_step=infer_step,
+            infer_step=inference_steps,
             guidance_scale=guidance_scale,
             save_path=output_path,
             manual_seeds=str(seed)

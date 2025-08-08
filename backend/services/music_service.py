@@ -14,8 +14,7 @@ from shared.models import (
     ServiceConfig,
     GPUType
 )
-from shared.modal_images import music_generation_image
-from shared.modal_config import model_volume, hf_volume, music_gen_secrets
+from shared.deployment import music_generation_image, model_volume, hf_volume, music_gen_secrets
 from shared.config import settings
 from shared.utils import ensure_output_dir, generate_temp_filepath, FileManager
 
@@ -24,15 +23,10 @@ logger = logging.getLogger(__name__)
 # Create Modal app with optimized configuration for music generation
 app = modal.App("music-generator-core")
 
-# Music service configuration optimized for high-memory GPU instances
+# Get service configuration from settings
 music_config = ServiceConfig(
     service_name="music-generator-core",
-    gpu_type=GPUType.L40S,  # High-memory GPU for ACE-Step pipeline
-    scaledown_window=60,    # 60-second scaledown for cost optimization
-    max_runtime_seconds=600,  # 10-minute timeout for music generation
-    max_concurrent_requests=3,  # Limited concurrency for GPU-intensive operations
-    memory_gb=32,           # 32GB memory for large models
-    cost_per_hour=4.50      # L40S cost estimate
+    **settings.get_service_config("music")
 )
 
 
@@ -134,7 +128,7 @@ class SimpleCostMonitor:
     secrets=[music_gen_secrets],
     scaledown_window=music_config.scaledown_window,
     timeout=music_config.max_runtime_seconds,
-    memory=music_config.memory_gb * 1024,  # Convert GB to MB
+    memory=(music_config.memory_gb or 32) * 1024,  # Convert GB to MB, default 32GB
     cpu=8.0  # 8 CPU cores for processing
 )
 class MusicGenCoreServer:
@@ -154,12 +148,8 @@ class MusicGenCoreServer:
         self.cost_monitor = SimpleCostMonitor()
         self.timeout_manager = SimpleTimeoutManager()
         
-        # For testing, force local storage to save costs
-        settings.switch_to_local_storage("./outputs")
-        self.file_manager = FileManager(
-            use_s3=settings.use_s3_storage,
-            local_storage_dir=settings.local_storage_dir
-        )
+        # Initialize FileManager
+        self.file_manager = FileManager()
         
         logger.info("Loading ACE-Step music generation model...")
         logger.info(f"Storage mode: {'S3' if settings.use_s3_storage else 'Local'} ({settings.local_storage_dir})")
@@ -216,7 +206,7 @@ class MusicGenCoreServer:
             prompt=request.prompt,
             lyrics=final_lyrics,
             audio_duration=request.audio_duration,
-            infer_step=request.infer_step,
+            infer_step=request.inference_steps,
             guidance_scale=request.guidance_scale,
             save_path=output_path,
             manual_seeds=str(request.seed)
@@ -372,7 +362,7 @@ Urban legends ride, we ain't ever numb,
 Circuits sparking live, tapping on the drum,
 Living on the edge, never succumb.""",
             audio_duration=60,  # Shorter duration for demo
-            infer_step=30,      # Fewer steps for faster generation
+            inference_steps=30,      # Fewer steps for faster generation
             guidance_scale=15
         )
         
@@ -559,7 +549,7 @@ def test_music_generation():
             prompt="upbeat electronic dance music, 128 bpm, energetic",
             lyrics="[verse]\nDancing through the night\nLights are shining bright\n[chorus]\nFeel the beat tonight\nEverything's alright",
             audio_duration=30,  # Short duration for testing
-            infer_step=20,      # Fewer steps for faster generation
+            inference_steps=20,      # Fewer steps for faster generation
             guidance_scale=15
         )
         

@@ -12,20 +12,13 @@ from shared.models import (
     PromptGenerationResponse,
     CategoryGenerationRequest,
     CategoryGenerationResponse,
-    LyricsGenerationRequestEnhanced,
-    LyricsGenerationResponseEnhanced,
-    PromptGenerationRequestEnhanced,
-    PromptGenerationResponseEnhanced,
-    CategoryGenerationRequestEnhanced,
-    CategoryGenerationResponseEnhanced,
     ServiceConfig,
     GPUType,
     GenerationMetadata
 )
-from shared.modal_config import llm_image, hf_volume, music_gen_secrets
+from shared.deployment import llm_image, hf_volume, music_gen_secrets
 from shared.config import settings
-
-from shared.utils import TimeoutManager, CostMonitor
+from shared.monitoring import TimeoutManager, CostMonitor
 from prompts import LYRICS_GENERATOR_PROMPT, PROMPT_GENERATOR_PROMPT
 from typing import List, Dict, Any, Optional
 
@@ -33,14 +26,10 @@ logger = logging.getLogger(__name__)
 
 app = modal.App("lyrics-generator")
 
-# Create optimized configuration for lyrics service
+# Get service configuration from settings
 lyrics_config = ServiceConfig(
     service_name="lyrics-generator",
-    gpu_type=GPUType.T4,  # CPU or T4 for cost optimization
-    scaledown_window=30,  # Fast scaledown for text generation
-    max_runtime_seconds=60,  # Short timeout for text generation
-    max_concurrent_requests=20,  # Higher concurrency for lightweight operations
-    cost_per_hour=0.35  # T4 cost
+    **settings.get_service_config("lyrics")
 )
 
 
@@ -234,7 +223,8 @@ class LyricsGenServer:
                     detail="Description must be at least 5 characters long"
                 )
             
-            description = self.validate_text_input(request.description, max_length=1000)
+            from shared.models.base import validate_text_input
+            description = validate_text_input(request.description, min_length=5, max_length=1000)
             
             # Check if model is loaded
             if not self._model_loaded:
@@ -317,7 +307,8 @@ class LyricsGenServer:
                 )
             
             self._validate_request_size(request.description)
-            description = self.validate_text_input(request.description, max_length=1000)
+            from shared.models.base import validate_text_input
+            description = validate_text_input(request.description, min_length=5, max_length=1000)
             
             # Check if model is loaded
             if not self._model_loaded:
@@ -412,7 +403,8 @@ class LyricsGenServer:
                 )
             
             self._validate_request_size(request.description)
-            description = self.validate_text_input(request.description, max_length=1000)
+            from shared.models.base import validate_text_input
+            description = validate_text_input(request.description, min_length=5, max_length=1000)
             
             # Check if model is loaded
             if not self._model_loaded:
@@ -484,321 +476,38 @@ class LyricsGenServer:
                 detail="Internal server error during category generation"
             )
 
-    # Enhanced endpoints with comprehensive models and metadata
-    @modal.fastapi_endpoint(method="POST")
-    def generate_lyrics_enhanced(self, request: LyricsGenerationRequestEnhanced) -> LyricsGenerationResponseEnhanced:
-        """Enhanced lyrics generation with comprehensive metadata"""
-        logger.info(f"Enhanced lyrics generation for: {request.description[:100]}...")
-        
-        # Start operation monitoring
-        operation_id = str(uuid.uuid4())
-        start_time = time.time()
-        
-        try:
-            # Start monitoring
-            self.cost_monitor.start_operation(
-                operation_id, 
-                lyrics_config.gpu_type.value, 
-                lyrics_config.service_name
-            )
-            self.timeout_manager.start_timeout(operation_id, lyrics_config.max_runtime_seconds)
-            
-            # Build enhanced prompt with style and mood
-            style_part = f" in {request.style} style" if request.style else ""
-            mood_part = f" with {request.mood} mood" if request.mood else ""
-            language_part = f" in {request.language}" if request.language != "english" else ""
-            
-            enhanced_description = f"{request.description}{style_part}{mood_part}{language_part}"
-            full_prompt = LYRICS_GENERATOR_PROMPT.format(description=enhanced_description)
-            
-            # Generate lyrics
-            lyrics = self.prompt_qwen(full_prompt, operation_id)
-            
-            # Analyze lyrics structure
-            word_count = len(lyrics.split())
-            structure_tags = self._extract_structure_tags(lyrics)
-            
-            # End monitoring and create metadata
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            
-            metadata = self.create_metadata(
-                operation_id, 
-                f"{settings.llm_model_id} (Enhanced)", 
-                start_time
-            )
-            
-            logger.info(f"Enhanced lyrics generated: {word_count} words, {len(structure_tags)} structure tags")
-            
-            return LyricsGenerationResponseEnhanced(
-                lyrics=lyrics,
-                word_count=word_count,
-                structure_tags=structure_tags,
-                metadata=metadata
-            )
-            
-        except Exception as e:
-            # Cleanup monitoring on error
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            logger.error(f"Enhanced lyrics generation failed: {e}")
-            raise
-
-    @modal.fastapi_endpoint(method="POST")
-    def generate_prompt_enhanced(self, request: PromptGenerationRequestEnhanced) -> PromptGenerationResponseEnhanced:
-        """Enhanced prompt generation with comprehensive metadata"""
-        logger.info(f"Enhanced prompt generation for: {request.description[:100]}...")
-        
-        # Start operation monitoring
-        operation_id = str(uuid.uuid4())
-        start_time = time.time()
-        
-        try:
-            # Start monitoring
-            self.cost_monitor.start_operation(
-                operation_id, 
-                lyrics_config.gpu_type.value, 
-                lyrics_config.service_name
-            )
-            self.timeout_manager.start_timeout(operation_id, lyrics_config.max_runtime_seconds)
-            
-            # Build enhanced prompt with additional context
-            context_parts = []
-            if request.genre:
-                context_parts.append(f"Genre: {request.genre}")
-            if request.instruments:
-                context_parts.append(f"Instruments: {', '.join(request.instruments)}")
-            if request.tempo:
-                context_parts.append(f"Tempo: {request.tempo}")
-            
-            enhanced_description = request.description
-            if context_parts:
-                enhanced_description += f" ({'; '.join(context_parts)})"
-            
-            full_prompt = PROMPT_GENERATOR_PROMPT.format(user_prompt=enhanced_description)
-            prompt = self.prompt_qwen(full_prompt, operation_id)
-            
-            # Analyze prompt
-            tag_count = len([tag.strip() for tag in prompt.split(',') if tag.strip()])
-            detected_genre = self._detect_primary_genre(prompt)
-            
-            # End monitoring and create metadata
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            
-            metadata = self.create_metadata(
-                operation_id, 
-                f"{settings.llm_model_id} (Enhanced)", 
-                start_time
-            )
-            
-            logger.info(f"Enhanced prompt generated: {tag_count} tags, genre: {detected_genre}")
-            
-            return PromptGenerationResponseEnhanced(
-                prompt=prompt,
-                tag_count=tag_count,
-                detected_genre=detected_genre,
-                metadata=metadata
-            )
-            
-        except Exception as e:
-            # Cleanup monitoring on error
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            logger.error(f"Enhanced prompt generation failed: {e}")
-            raise
-
-    @modal.fastapi_endpoint(method="POST")
-    def generate_categories_enhanced(self, request: CategoryGenerationRequestEnhanced) -> CategoryGenerationResponseEnhanced:
-        """Enhanced category generation with comprehensive metadata"""
-        logger.info(f"Enhanced category generation for: {request.description[:100]}...")
-        
-        # Start operation monitoring
-        operation_id = str(uuid.uuid4())
-        start_time = time.time()
-        
-        try:
-            # Start monitoring
-            self.cost_monitor.start_operation(
-                operation_id, 
-                lyrics_config.gpu_type.value, 
-                lyrics_config.service_name
-            )
-            self.timeout_manager.start_timeout(operation_id, lyrics_config.max_runtime_seconds)
-            
-            # Build enhanced prompt
-            subgenre_instruction = " Include subgenres where relevant." if request.include_subgenres else " Focus on main genres only."
-            
-            prompt = (
-                f"Based on the following music description, list {request.max_categories} relevant genres or categories "
-                f"as a comma-separated list.{subgenre_instruction} "
-                f"For example: Pop, Electronic, Sad, 80s. "
-                f"Description: '{request.description}'"
-            )
-            
-            response_text = self.prompt_qwen(prompt, operation_id)
-            categories = [cat.strip() for cat in response_text.split(",") if cat.strip()]
-            
-            # Limit to requested number
-            categories = categories[:request.max_categories]
-            
-            # Ensure we have at least some categories
-            if not categories:
-                categories = ["Unknown"]
-            
-            # Analyze categories
-            primary_genre = self._identify_primary_genre(categories)
-            confidence_scores = self._calculate_confidence_scores(categories, request.description)
-            
-            # End monitoring and create metadata
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            
-            metadata = self.create_metadata(
-                operation_id, 
-                f"{settings.llm_model_id} (Enhanced)", 
-                start_time
-            )
-            
-            logger.info(f"Enhanced categories generated: {len(categories)} categories, primary: {primary_genre}")
-            
-            return CategoryGenerationResponseEnhanced(
-                categories=categories,
-                primary_genre=primary_genre,
-                confidence_scores=confidence_scores,
-                metadata=metadata
-            )
-            
-        except Exception as e:
-            # Cleanup monitoring on error
-            self.cost_monitor.end_operation(operation_id)
-            self.timeout_manager.end_timeout(operation_id)
-            logger.error(f"Enhanced category generation failed: {e}")
-            raise
-
-    def _extract_structure_tags(self, lyrics: str) -> List[str]:
-        """Extract structure tags from lyrics"""
-        import re
-        tags = re.findall(r'\[([^\]]+)\]', lyrics.lower())
-        return list(set(tags))  # Remove duplicates
-
-    def _detect_primary_genre(self, prompt: str) -> Optional[str]:
-        """Detect primary genre from prompt tags"""
-        common_genres = [
-            'pop', 'rock', 'electronic', 'hip hop', 'rap', 'jazz', 'blues', 
-            'country', 'folk', 'classical', 'reggae', 'punk', 'metal', 'funk'
-        ]
-        
-        prompt_lower = prompt.lower()
-        for genre in common_genres:
-            if genre in prompt_lower:
-                return genre.title()
-        return None
-
-    def _identify_primary_genre(self, categories: List[str]) -> Optional[str]:
-        """Identify primary genre from categories list"""
-        if not categories:
-            return None
-        
-        # First category is usually the primary genre
-        primary = categories[0].lower()
-        
-        # Map common variations to standard genres
-        genre_mapping = {
-            'edm': 'Electronic',
-            'techno': 'Electronic',
-            'house': 'Electronic',
-            'hiphop': 'Hip Hop',
-            'r&b': 'R&B',
-            'rnb': 'R&B'
-        }
-        
-        return genre_mapping.get(primary, categories[0])
-
-    def _calculate_confidence_scores(self, categories: List[str], description: str) -> Dict[str, float]:
-        """Calculate confidence scores for categories based on description"""
-        scores = {}
-        description_lower = description.lower()
-        
-        for category in categories:
-            # Simple confidence based on keyword presence
-            category_lower = category.lower()
-            if category_lower in description_lower:
-                scores[category] = 0.9
-            elif any(word in description_lower for word in category_lower.split()):
-                scores[category] = 0.7
-            else:
-                scores[category] = 0.5
-        
-        return scores
-
-    def _start_monitoring(self, operation_id: str):
-        """Safely start monitoring"""
-        try:
-            if hasattr(self, 'cost_monitor'):
-                self.cost_monitor.start_operation(
-                    operation_id, 
-                    lyrics_config.gpu_type.value, 
-                    lyrics_config.service_name
-                )
-            if hasattr(self, 'timeout_manager'):
-                self.timeout_manager.start_timeout(operation_id, lyrics_config.max_runtime_seconds)
-        except Exception as e:
-            logger.warning(f"Failed to start monitoring for {operation_id}: {e}")
-    
-    def _end_monitoring(self, operation_id: str):
-        """Safely end monitoring"""
-        try:
-            if hasattr(self, 'cost_monitor'):
-                self.cost_monitor.end_operation(operation_id)
-            if hasattr(self, 'timeout_manager'):
-                self.timeout_manager.end_timeout(operation_id)
-        except Exception as e:
-            logger.warning(f"Failed to end monitoring for {operation_id}: {e}")
-
-    def _cleanup_operation(self, operation_id: str):
-        """Cleanup monitoring for failed operations"""
-        self._end_monitoring(operation_id)
-    
-    def validate_text_input(self, text: str, max_length: int = 1000) -> str:
-        """Validate and clean text input"""
-        if not text or not text.strip():
-            raise ValueError("Text input cannot be empty")
-        
-        # Clean text
-        cleaned = text.strip()
-        
-        # Check length
-        if len(cleaned) > max_length:
-            raise ValueError(f"Text too long. Maximum length: {max_length}")
-        
-        return cleaned
-
+    # Helper methods for analysis
     def create_metadata(self, operation_id: str, model_info: str, start_time: float) -> GenerationMetadata:
-        """Create metadata for enhanced responses"""
-        generation_time = time.time() - start_time
-        estimated_cost = generation_time * (lyrics_config.cost_per_hour / 3600)  # Convert to per-second cost
-        
-        return GenerationMetadata(
+        """Create metadata for responses"""
+        from shared.utils import create_metadata
+        return create_metadata(
             operation_id=operation_id,
             model_info=model_info,
-            generation_time=generation_time,
-            estimated_cost=estimated_cost,
-            gpu_type=lyrics_config.gpu_type.value
+            start_time=start_time,
+            gpu_type=lyrics_config.gpu_type.value,
+            cost_per_hour=lyrics_config.cost_per_hour
         )
 
-    def _validate_request_size(self, request_data: str, max_size: int = 10000):
+    def _cleanup_operation(self, operation_id: str):
+        """Clean up monitoring for failed operations"""
+        try:
+            self.cost_monitor.end_operation(operation_id)
+            self.timeout_manager.end_timeout(operation_id)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup operation {operation_id}: {e}")
+    
+    def _validate_request_size(self, text: str):
         """Validate request size to prevent abuse"""
-        if len(request_data.encode('utf-8')) > max_size:
+        if len(text) > settings.max_prompt_length:
             raise HTTPException(
-                status_code=413, 
-                detail=f"Request too large. Maximum size: {max_size} bytes"
+                status_code=413,
+                detail=f"Request too large: {len(text)} > {settings.max_prompt_length}"
             )
 
 
 @app.local_entrypoint()
 def test_lyrics_generation():
-    """测试优化后的歌词生成服务"""
+    """Test lyrics generation service with improved error handling"""
     import requests
     import time
     
@@ -806,105 +515,104 @@ def test_lyrics_generation():
     
     print(f"Testing Lyrics Generation Service")
     print(f"Configuration: {lyrics_config.service_name} on {lyrics_config.gpu_type.value}")
-    print(f"Scaledown window: {lyrics_config.scaledown_window}s")
-    print(f"Max runtime: {lyrics_config.max_runtime_seconds}s")
     print("-" * 50)
     
-    # Wait a bit for the service to fully initialize
-    print("Waiting for service to initialize...")
-    time.sleep(5)
+    # Wait longer for service to initialize (model loading takes time)
+    print("Waiting for service to initialize (model loading may take 30-60 seconds)...")
+    time.sleep(15)
     
-    # 测试健康检查
-    try:
-        health_url = server.health_check.get_web_url()
-        print(f"Health check URL: {health_url}")
-        response = requests.get(health_url, timeout=30)
-        response.raise_for_status()
-        health = response.json()
-        print(f"Health check: {health}")
-        
-        if not health.get('model_loaded', False):
-            print("WARNING: Model not loaded yet, waiting...")
-            time.sleep(10)
+    # Test health check with retries
+    health_url = server.health_check.get_web_url()
+    print(f"Health check URL: {health_url}")
+    
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            print(f"Health check attempt {attempt + 1}/{max_retries}...")
+            response = requests.get(health_url, timeout=60)  # Increased timeout
+            response.raise_for_status()
+            health = response.json()
+            print(f"✓ Health check successful: {health}")
             
-    except Exception as e:
-        print(f"Health check failed: {e}")
-        return
+            if not health.get('model_loaded', False):
+                print("⚠️  Model not loaded yet, waiting...")
+                time.sleep(20)
+                continue
+            else:
+                print("✓ Model is loaded and ready")
+                break
+                
+        except requests.exceptions.Timeout:
+            print(f"⚠️  Health check timeout (attempt {attempt + 1})")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+                continue
+            else:
+                print("❌ Health check failed after all retries")
+                return
+        except Exception as e:
+            print(f"❌ Health check error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+                continue
+            else:
+                return
     
-    # Test basic endpoints first
+    # Test basic endpoints
+    print("\n" + "="*50)
+    print("Testing Service Endpoints")
+    print("="*50)
+    
     basic_tests = [
         ("generate_lyrics", LyricsGenerationRequest(description="a happy song about sunshine")),
         ("generate_prompt", PromptGenerationRequest(description="upbeat electronic music")),
         ("generate_categories", CategoryGenerationRequest(description="electronic dance music"))
     ]
     
+    success_count = 0
     for endpoint_name, request_obj in basic_tests:
         try:
             endpoint = getattr(server, endpoint_name)
             url = endpoint.get_web_url()
-            print(f"Testing {endpoint_name} at {url}")
+            print(f"\nTesting {endpoint_name}...")
+            print(f"URL: {url}")
             
-            response = requests.post(url, json=request_obj.model_dump(), timeout=60)
+            start_time = time.time()
+            response = requests.post(url, json=request_obj.model_dump(), timeout=90)
+            duration = time.time() - start_time
+            
             response.raise_for_status()
             result = response.json()
             
-            print(f"✓ {endpoint_name} succeeded")
+            print(f"✓ {endpoint_name} succeeded in {duration:.2f}s")
+            
+            # Show some result details
             if 'lyrics' in result:
                 print(f"  Lyrics preview: {result['lyrics'][:100]}...")
             elif 'prompt' in result:
                 print(f"  Prompt: {result['prompt']}")
             elif 'categories' in result:
                 print(f"  Categories: {result['categories']}")
-            print("-" * 50)
+            
+            success_count += 1
             
         except requests.exceptions.Timeout:
-            print(f"✗ {endpoint_name} timed out")
+            print(f"❌ {endpoint_name} timed out")
         except requests.exceptions.RequestException as e:
-            print(f"✗ {endpoint_name} failed with request error: {e}")
+            print(f"❌ {endpoint_name} request failed: {e}")
         except Exception as e:
-            print(f"✗ {endpoint_name} failed: {e}")
+            print(f"❌ {endpoint_name} failed: {e}")
     
-    print("Basic testing completed!")
+    print(f"\n" + "="*50)
+    print(f"Test Summary: {success_count}/{len(basic_tests)} endpoints successful")
+    print("="*50)
     
-    # Only test enhanced endpoints if basic ones work
-    print("Testing enhanced endpoints...")
-    
-    enhanced_tests = [
-        ("generate_lyrics_enhanced", LyricsGenerationRequestEnhanced(
-            description="a melancholic song about rain",
-            style="ballad",
-            mood="sad"
-        )),
-        ("generate_prompt_enhanced", PromptGenerationRequestEnhanced(
-            description="upbeat dance music",
-            genre="electronic",
-            instruments=["synthesizer"]
-        )),
-        ("generate_categories_enhanced", CategoryGenerationRequestEnhanced(
-            description="electronic dance music",
-            max_categories=5
-        ))
-    ]
-    
-    for endpoint_name, request_obj in enhanced_tests:
-        try:
-            endpoint = getattr(server, endpoint_name)
-            url = endpoint.get_web_url()
-            print(f"Testing {endpoint_name}")
-            
-            response = requests.post(url, json=request_obj.model_dump(), timeout=60)
-            response.raise_for_status()
-            result = response.json()
-            
-            print(f"✓ {endpoint_name} succeeded")
-            print("-" * 50)
-            
-        except requests.exceptions.Timeout:
-            print(f"✗ {endpoint_name} timed out")
-        except Exception as e:
-            print(f"✗ {endpoint_name} failed: {e}")
-    
-    print("All testing completed!")
+    if success_count == len(basic_tests):
+        print("🎉 All tests passed!")
+    elif success_count > 0:
+        print("⚠️  Some tests passed, some failed")
+    else:
+        print("❌ All tests failed")
 
 
 if __name__ == "__main__":

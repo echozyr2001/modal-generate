@@ -7,27 +7,21 @@ from PIL import Image
 
 from shared.models import (
     CoverImageGenerationRequest, 
-    CoverImageGenerationResponseEnhanced,
+    CoverImageGenerationResponse,
     ServiceConfig,
     GPUType,
     GenerationMetadata
 )
-from shared.modal_images import image_generation_image
-from shared.modal_config import hf_volume, music_gen_secrets
-from shared.utils import FileManager
+from shared.deployment import image_generation_image, hf_volume, music_gen_secrets
+from shared.storage import FileManager
 from shared.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Service configuration optimized for mid-tier GPU (T4/L4) with 45-second scaledown
+# Get service configuration from settings
 cover_image_config = ServiceConfig(
     service_name="cover-image-generator",
-    gpu_type=GPUType.L4,  # Mid-tier GPU for SDXL-Turbo
-    scaledown_window=45,  # 45-second scaledown window
-    max_runtime_seconds=120,  # 2 minutes max for image generation
-    max_concurrent_requests=5,  # Reasonable limit for GPU service
-    memory_gb=16,  # Sufficient for SDXL-Turbo
-    cost_per_hour=0.60  # L4 cost estimate
+    **settings.get_service_config("image")
 )
 
 app = modal.App("cover-image-generator")
@@ -86,12 +80,7 @@ class CoverImageGenServer:
         self._model_loaded = False
         
         # Initialize FileManager for storage handling
-        # For testing, force local storage to save costs
-        settings.switch_to_local_storage("./outputs")
-        self.file_manager = FileManager(
-            use_s3=settings.use_s3_storage,
-            local_storage_dir=settings.local_storage_dir
-        )
+        self.file_manager = FileManager()
         
         # Simple timeout manager
         self.timeout_manager = SimpleTimeoutManager()
@@ -290,7 +279,7 @@ class CoverImageGenServer:
         )
 
     @modal.fastapi_endpoint(method="POST")
-    def generate_cover_image(self, request: CoverImageGenerationRequest) -> CoverImageGenerationResponseEnhanced:
+    def generate_cover_image(self, request: CoverImageGenerationRequest) -> CoverImageGenerationResponse:
         """Generate single cover image with comprehensive error handling and validation"""
         logger.info(f"Generating cover image for prompt: {request.prompt[:100]}...")
         
@@ -319,7 +308,7 @@ class CoverImageGenServer:
                     start_time=start_time
                 )
                 
-                response = CoverImageGenerationResponseEnhanced(
+                response = CoverImageGenerationResponse(
                     file_path=result["file_path"],
                     image_dimensions=result["image_dimensions"],
                     file_size_mb=result["file_size_mb"],
@@ -427,7 +416,7 @@ class CoverImageGenServer:
                         start_time=start_time
                     )
                     
-                    response = CoverImageGenerationResponseEnhanced(
+                    response = CoverImageGenerationResponse(
                         file_path=result["file_path"],
                         image_dimensions=result["image_dimensions"],
                         file_size_mb=result["file_size_mb"],
@@ -722,7 +711,7 @@ def test_cover_generation():
                 endpoint_url = server.generate_cover_image.get_web_url()
                 response = requests.post(endpoint_url, json=request.model_dump(), timeout=120)
                 response.raise_for_status()
-                cover_response = CoverImageGenerationResponseEnhanced(**response.json())
+                cover_response = CoverImageGenerationResponse(**response.json())
                 
                 print(f"✓ Style '{style}' succeeded:")
                 print(f"  File: {cover_response.file_path}")
