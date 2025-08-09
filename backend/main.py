@@ -5,23 +5,63 @@ import modal
 import os
 import boto3
 
+from pydantic import BaseModel
 import requests
-from shared.models import (
-    AudioGenerationBase,
-    GenerateFromDescriptionRequest,
-    GenerateWithCustomLyricsRequest,
-    GenerateWithDescribedLyricsRequest,
-    GenerateMusicResponseS3,
-    GenerateMusicResponse
-)
-from shared.deployment import music_generation_image, model_volume, hf_volume, music_gen_secrets
+
 from prompts import LYRICS_GENERATOR_PROMPT, PROMPT_GENERATOR_PROMPT
 
 app = modal.App("music-generator")
 
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git")
+    .pip_install_from_requirements("requirements.txt")
+    .run_commands(["git clone https://github.com/ace-step/ACE-Step.git /tmp/ACE-Step", "cd /tmp/ACE-Step && pip install ."])
+    .env({"HF_HOME": "/.cache/huggingface"})
+    .add_local_python_source("prompts")
+)
+
+model_volume = modal.Volume.from_name(
+    "ace-step-models", create_if_missing=True)
+hf_volume = modal.Volume.from_name("qwen-hf-cache", create_if_missing=True)
+
+music_gen_secrets = modal.Secret.from_name("music-gen-secret")
+
+
+class AudioGenerationBase(BaseModel):
+    audio_duration: float = 180.0
+    seed: int = -1
+    guidance_scale: float = 15.0
+    infer_step: int = 60
+    instrumental: bool = False
+
+
+class GenerateFromDescriptionRequest(AudioGenerationBase):
+    full_described_song: str
+
+
+class GenerateWithCustomLyricsRequest(AudioGenerationBase):
+    prompt: str
+    lyrics: str
+
+
+class GenerateWithDescribedLyricsRequest(AudioGenerationBase):
+    prompt: str
+    described_lyrics: str
+
+
+class GenerateMusicResponseS3(BaseModel):
+    s3_key: str
+    cover_image_s3_key: str
+    categories: List[str]
+
+
+class GenerateMusicResponse(BaseModel):
+    audio_data: str
+
 
 @app.cls(
-    image=music_generation_image,
+    image=image,
     gpu="L40S",
     volumes={"/models": model_volume, "/.cache/huggingface": hf_volume},
     secrets=[music_gen_secrets],
@@ -113,7 +153,7 @@ class MusicGenServer:
             lyrics: str,
             instrumental: bool,
             audio_duration: float,
-            inference_steps: int,
+            infer_step: int,
             guidance_scale: float,
             seed: int,
             description_for_categorization: str
@@ -133,7 +173,7 @@ class MusicGenServer:
             prompt=prompt,
             lyrics=final_lyrics,
             audio_duration=audio_duration,
-            infer_step=inference_steps,
+            infer_step=infer_step,
             guidance_scale=guidance_scale,
             save_path=output_path,
             manual_seeds=str(seed)
@@ -164,7 +204,7 @@ class MusicGenServer:
             categories=categories
         )
 
-    @modal.fastapi_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
     def generate(self) -> GenerateMusicResponse:
         output_dir = "/tmp/outputs"
         os.makedirs(output_dir, exist_ok=True)
@@ -218,7 +258,7 @@ class MusicGenServer:
 @app.local_entrypoint()
 def main():
     server = MusicGenServer()
-    endpoint_url = server.generate.get_web_url()
+    endpoint_url = server.generate_with_described_lyrics.get_web_url()
 
     request_data = GenerateWithDescribedLyricsRequest(
         prompt="rave, funk, 140BPM, disco",
@@ -230,12 +270,12 @@ def main():
 
     response = requests.post(endpoint_url, json=payload)
     response.raise_for_status()
-    result = GenerateMusicResponse(**response.json())
+    result = GenerateMusicResponseS3(**response.json())
 
-    # print(
-    #     f"Success: {result.s3_key} {result.cover_image_s3_key} {result.categories}")
+    print(
+        f"Success: {result.s3_key} {result.cover_image_s3_key} {result.categories}")
 
-    audio_bytes = base64.b64decode(result.audio_data)
-    output_filename = "generated.wav"
-    with open(output_filename, "wb") as f:
-        f.write(audio_bytes)
+    # audio_bytes = base64.b64decode(result.audio_data)
+    # output_filename = "generated.wav"
+    # with open(output_filename, "wb") as f:
+    #     f.write(audio_bytes)

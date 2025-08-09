@@ -394,6 +394,35 @@ class CoverImageGenServer:
             "style_mixing_supported": True
         }
     
+    @modal.fastapi_endpoint(method="GET")
+    def download_image(self, file_path: str) -> Dict[str, Any]:
+        """Download image as base64 encoded data"""
+        try:
+            if not os.path.exists(file_path):
+                raise HTTPException(status_code=404, detail="Image file not found")
+            
+            # Read image and convert to base64
+            with open(file_path, "rb") as image_file:
+                image_data = image_file.read()
+                base64_data = base64.b64encode(image_data).decode('utf-8')
+            
+            # Get image info
+            with Image.open(file_path) as img:
+                width, height = img.size
+                format_type = img.format or "PNG"
+            
+            return {
+                "image_data": base64_data,
+                "format": format_type.lower(),
+                "width": width,
+                "height": height,
+                "file_size_bytes": len(image_data)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to download image {file_path}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to download image")
+    
     def get_style_recommendations(self) -> Dict[str, str]:
         """Get style recommendations"""
         return {
@@ -473,6 +502,52 @@ def test_cover_image_service():
         print(f"  Dimensions: {result['image_dimensions']}")
         print(f"  File size: {result['file_size_mb']}MB")
         print(f"  Generation time: {result['metadata']['generation_time']:.2f}s")
+        
+        # Download the generated image to local directory
+        try:
+            print("\nDownloading generated image...")
+            
+            # Create local output directory
+            local_output_dir = "./test_outputs"
+            os.makedirs(local_output_dir, exist_ok=True)
+            
+            # Use the download endpoint to get the image
+            download_url = server.download_image.get_web_url()
+            download_response = requests.get(
+                download_url, 
+                params={"file_path": result['file_path']},
+                timeout=30
+            )
+            download_response.raise_for_status()
+            download_data = download_response.json()
+            
+            # Decode base64 and save locally
+            import base64
+            image_bytes = base64.b64decode(download_data['image_data'])
+            
+            remote_filename = os.path.basename(result['file_path'])
+            local_file_path = os.path.join(local_output_dir, f"test_cover_{remote_filename}")
+            
+            with open(local_file_path, 'wb') as f:
+                f.write(image_bytes)
+            
+            print(f"  ✓ Image downloaded: {local_file_path}")
+            print(f"  ✓ Image size: {download_data['width']}x{download_data['height']}")
+            print(f"  ✓ Format: {download_data['format'].upper()}")
+            print(f"  ✓ File size: {download_data['file_size_bytes']} bytes")
+            
+            # Verify the downloaded image
+            try:
+                from PIL import Image
+                with Image.open(local_file_path) as img:
+                    print(f"  ✓ Image verified locally: {img.size}, mode: {img.mode}")
+            except Exception as e:
+                print(f"  ⚠ Could not verify downloaded image: {e}")
+                
+        except Exception as e:
+            print(f"  ⚠ Failed to download image: {e}")
+            import traceback
+            traceback.print_exc()
         
         print("\n" + "="*50)
         print("Cover image service test completed successfully!")

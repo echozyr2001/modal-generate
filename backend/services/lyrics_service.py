@@ -68,14 +68,21 @@ class LyricsGenServer:
         logger.info(f"Loading LLM model: {settings.llm_model_id} on {self.config.gpu_type.value}")
         
         try:
-            # Load tokenizer (same as main.py)
+            # Load tokenizer with proper pad token handling
             self.tokenizer = AutoTokenizer.from_pretrained(
                 settings.llm_model_id,
                 cache_dir=settings.hf_cache_dir
             )
             
+            # Set pad token properly to avoid attention mask warnings
             if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+                # Try to use a different token for padding if available
+                if hasattr(self.tokenizer, 'unk_token') and self.tokenizer.unk_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.unk_token
+                else:
+                    # Fallback to eos_token but we'll handle attention mask explicitly
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                    logger.info("Using eos_token as pad_token - attention mask will be handled explicitly")
             
             # Load model with proper device handling (same as main.py)
             device = "cuda" if torch.cuda.is_available() and self.config.gpu_type != GPUType.CPU else "cpu"
@@ -118,13 +125,27 @@ class LyricsGenServer:
             tokenize=False,
             add_generation_prompt=True
         )
+        
+        # Tokenize with explicit attention mask creation
         model_inputs = self.tokenizer(
-            [text], return_tensors="pt").to(self.model.device)
+            [text], 
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            return_attention_mask=True
+        ).to(self.model.device)
 
+        # Generate with explicit attention mask
         generated_ids = self.model.generate(
             model_inputs.input_ids,
-            max_new_tokens=512
+            attention_mask=model_inputs.attention_mask,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            pad_token_id=self.tokenizer.eos_token_id
         )
+        
+        # Extract only the new tokens
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
@@ -134,7 +155,7 @@ class LyricsGenServer:
 
         return response
     
-    def generate_prompt(self, description: str) -> str:
+    def _generate_prompt(self, description: str) -> str:
         """
         Generate music prompt - extracted from main.py
         """
@@ -143,7 +164,7 @@ class LyricsGenServer:
         # Run LLM inference and return that
         return self.prompt_qwen(full_prompt)
 
-    def generate_lyrics(self, description: str) -> str:
+    def _generate_lyrics(self, description: str) -> str:
         """
         Generate lyrics - extracted from main.py
         """
@@ -152,7 +173,7 @@ class LyricsGenServer:
         # Run LLM inference and return that
         return self.prompt_qwen(full_prompt)
 
-    def generate_categories(self, description: str) -> List[str]:
+    def _generate_categories(self, description: str) -> List[str]:
         """
         Generate categories - extracted from main.py
         """
@@ -249,7 +270,7 @@ class LyricsGenServer:
         
         try:
             # Generate lyrics using main.py method
-            lyrics = self.generate_lyrics(description)
+            lyrics = self._generate_lyrics(description)
             
             # End monitoring
             self.end_operation(operation_id, success=True)
@@ -282,7 +303,7 @@ class LyricsGenServer:
         
         try:
             # Generate prompt using main.py method
-            prompt = self.generate_prompt(description)
+            prompt = self._generate_prompt(description)
             
             # End monitoring
             self.end_operation(operation_id, success=True)
@@ -315,7 +336,7 @@ class LyricsGenServer:
         
         try:
             # Generate categories using main.py method
-            categories = self.generate_categories(description)
+            categories = self._generate_categories(description)
             
             # Ensure we have categories
             if not categories:
