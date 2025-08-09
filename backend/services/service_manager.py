@@ -12,57 +12,42 @@ from typing import List, Dict, Any
 # Service configurations
 SERVICES = {
     "lyrics": {
-        "module": "services.lyrics_service_unified",
-        "description": "Lyrics, prompt, and category generation service",
+        "module": "services.lyrics_service",
+        "description": "Lyrics, prompt, and category generation service (extracted from main.py)",
         "dependencies": []
     },
     "music": {
-        "module": "services.music_service_unified", 
-        "description": "Music generation service using ACE-Step",
+        "module": "services.music_service", 
+        "description": "Music generation service using ACE-Step (extracted from main.py)",
         "dependencies": []
     },
     "image": {
-        "module": "services.cover_image_service_unified",
-        "description": "Cover image generation service using SDXL-Turbo", 
+        "module": "services.cover_image_service",
+        "description": "Cover image generation service using SDXL-Turbo (extracted from main.py)", 
         "dependencies": []
     },
     "integrated": {
-        "module": "services.integrated_service_unified",
-        "description": "Integrated orchestration service",
+        "module": "services.integrated_service",
+        "description": "Integrated orchestration service (matches main.py API)",
         "dependencies": ["lyrics", "music", "image"]
     }
-}
-
-# Legacy service mappings
-LEGACY_SERVICES = {
-    "lyrics_legacy": "services.lyrics_service",
-    "music_legacy": "services.music_service", 
-    "image_legacy": "services.cover_image_service",
-    "integrated_legacy": "services.integrated_service"
 }
 
 
 def run_service(service_name: str, legacy: bool = False) -> int:
     """Run a specific service"""
-    if legacy:
-        if service_name not in LEGACY_SERVICES:
-            print(f"❌ Legacy service '{service_name}' not found")
-            return 1
-        module = LEGACY_SERVICES[service_name]
-        print(f"🚀 Running legacy service: {service_name}")
-    else:
-        if service_name not in SERVICES:
-            print(f"❌ Service '{service_name}' not found")
-            print(f"Available services: {', '.join(SERVICES.keys())}")
-            return 1
-        
-        service_config = SERVICES[service_name]
-        module = service_config["module"]
-        print(f"🚀 Running unified service: {service_name}")
-        print(f"   Description: {service_config['description']}")
-        
-        if service_config["dependencies"]:
-            print(f"   Dependencies: {', '.join(service_config['dependencies'])}")
+    if service_name not in SERVICES:
+        print(f"❌ Service '{service_name}' not found")
+        print(f"Available services: {', '.join(SERVICES.keys())}")
+        return 1
+    
+    service_config = SERVICES[service_name]
+    module = service_config["module"]
+    print(f"🚀 Running service: {service_name}")
+    print(f"   Description: {service_config['description']}")
+    
+    if service_config["dependencies"]:
+        print(f"   Dependencies: {', '.join(service_config['dependencies'])}")
     
     try:
         cmd = ["modal", "run", "-m", module]
@@ -82,21 +67,14 @@ def run_service(service_name: str, legacy: bool = False) -> int:
 
 def deploy_service(service_name: str, legacy: bool = False) -> int:
     """Deploy a specific service"""
-    if legacy:
-        if service_name not in LEGACY_SERVICES:
-            print(f"❌ Legacy service '{service_name}' not found")
-            return 1
-        module = LEGACY_SERVICES[service_name]
-        print(f"🚀 Deploying legacy service: {service_name}")
-    else:
-        if service_name not in SERVICES:
-            print(f"❌ Service '{service_name}' not found")
-            return 1
-        
-        service_config = SERVICES[service_name]
-        module = service_config["module"]
-        print(f"🚀 Deploying unified service: {service_name}")
-        print(f"   Description: {service_config['description']}")
+    if service_name not in SERVICES:
+        print(f"❌ Service '{service_name}' not found")
+        return 1
+    
+    service_config = SERVICES[service_name]
+    module = service_config["module"]
+    print(f"🚀 Deploying service: {service_name}")
+    print(f"   Description: {service_config['description']}")
     
     try:
         cmd = ["modal", "deploy", module]
@@ -116,50 +94,41 @@ def deploy_service(service_name: str, legacy: bool = False) -> int:
 
 def list_services():
     """List all available services"""
-    print("📋 Available Unified Services:")
+    print("📋 Available Services (extracted from main.py):")
     print("=" * 60)
     
     for name, config in SERVICES.items():
         deps = f" (depends on: {', '.join(config['dependencies'])})" if config['dependencies'] else ""
         print(f"  🔧 {name:<12} - {config['description']}{deps}")
     
-    print(f"\n📋 Available Legacy Services:")
-    print("=" * 60)
-    
-    for name, module in LEGACY_SERVICES.items():
-        print(f"  🔧 {name:<12} - {module}")
-    
     print(f"\n💡 Usage:")
     print(f"  python service_manager.py run <service_name>")
     print(f"  python service_manager.py deploy <service_name>")
-    print(f"  python service_manager.py run <service_name> --legacy")
+    print(f"  python service_manager.py run-all")
+    print(f"  python service_manager.py deploy-all")
 
 
 def run_all_services(legacy: bool = False):
     """Run all services in dependency order"""
-    if legacy:
-        print("🚀 Running all legacy services...")
-        services_to_run = list(LEGACY_SERVICES.keys())
-    else:
-        print("🚀 Running all unified services in dependency order...")
-        # Sort services by dependencies
-        services_to_run = []
-        remaining = set(SERVICES.keys())
+    print("🚀 Running all services in dependency order...")
+    # Sort services by dependencies
+    services_to_run = []
+    remaining = set(SERVICES.keys())
+    
+    while remaining:
+        # Find services with no unmet dependencies
+        ready = []
+        for service in remaining:
+            deps = SERVICES[service]["dependencies"]
+            if all(dep in services_to_run for dep in deps):
+                ready.append(service)
         
-        while remaining:
-            # Find services with no unmet dependencies
-            ready = []
-            for service in remaining:
-                deps = SERVICES[service]["dependencies"]
-                if all(dep in services_to_run for dep in deps):
-                    ready.append(service)
-            
-            if not ready:
-                print("❌ Circular dependency detected!")
-                return 1
-            
-            services_to_run.extend(ready)
-            remaining -= set(ready)
+        if not ready:
+            print("❌ Circular dependency detected!")
+            return 1
+        
+        services_to_run.extend(ready)
+        remaining -= set(ready)
     
     print(f"📋 Service execution order: {' → '.join(services_to_run)}")
     print("-" * 60)
@@ -178,12 +147,8 @@ def run_all_services(legacy: bool = False):
 
 def deploy_all_services(legacy: bool = False):
     """Deploy all services"""
-    if legacy:
-        print("🚀 Deploying all legacy services...")
-        services_to_deploy = list(LEGACY_SERVICES.keys())
-    else:
-        print("🚀 Deploying all unified services...")
-        services_to_deploy = list(SERVICES.keys())
+    print("🚀 Deploying all services...")
+    services_to_deploy = list(SERVICES.keys())
     
     print(f"📋 Services to deploy: {', '.join(services_to_deploy)}")
     print("-" * 60)
