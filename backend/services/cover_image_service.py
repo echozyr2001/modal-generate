@@ -24,7 +24,7 @@ from shared.models import (
 )
 from shared.deployment import image_generation_image, hf_volume, music_gen_secrets
 from shared.config import settings
-from shared.base_service import create_service_app
+from shared.base_service import create_service_app, ServiceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -45,22 +45,16 @@ app, app_config = create_service_app(
 
 
 @app.cls(**app_config)
-class CoverImageGenServer:
+class CoverImageGenServer(ServiceMixin):
     """Cover image generation server - extracted from main.py SDXL-Turbo functionality"""
     
     @modal.enter()
     def load_model(self):
         """Load SDXL-Turbo model for image generation"""
         from diffusers import AutoPipelineForText2Image
-        from shared.monitoring import CostMonitor, TimeoutManager
-        from shared.storage import FileManager
         
-        # Initialize service components (since we can't use __init__)
-        self.config = cover_image_config
-        self.cost_monitor = CostMonitor()
-        self.timeout_manager = TimeoutManager(cover_image_config.max_runtime_seconds)
-        self.file_manager = FileManager()
-        self._model_loaded = False
+        # Initialize service components using mixin
+        self.init_service_components(cover_image_config)
         self.model_id = "stabilityai/sdxl-turbo"
         
         logger.info(f"Loading image generation model: {self.model_id}")
@@ -233,58 +227,7 @@ class CoverImageGenServer:
             "storage_mode": self.file_manager.get_storage_mode()
         }
     
-    def validate_model_loaded(self):
-        """Validate that model is loaded"""
-        if not getattr(self, '_model_loaded', False):
-            raise RuntimeError("Model not loaded. Service temporarily unavailable.")
-    
-    def generate_operation_id(self) -> str:
-        """Generate unique operation ID"""
-        return str(uuid.uuid4())
-    
-    def start_operation(self, operation_id: str, operation_type: str = "generation"):
-        """Start monitoring for an operation"""
-        self.cost_monitor.start_operation(
-            operation_id, 
-            self.config.gpu_type.value, 
-            self.config.service_name,
-            {"operation_type": operation_type}
-        )
-        self.timeout_manager.start_timeout(
-            operation_id, 
-            self.config.max_runtime_seconds,
-            operation_type
-        )
-    
-    def end_operation(self, operation_id: str, success: bool = True):
-        """End monitoring for an operation"""
-        self.cost_monitor.end_operation(operation_id, success)
-        self.timeout_manager.end_timeout(operation_id)
-    
-    def check_timeout(self, operation_id: str) -> bool:
-        """Check if operation has timed out"""
-        return self.timeout_manager.check_timeout(operation_id)
-    
-    def cleanup_operation(self, operation_id: str):
-        """Clean up monitoring for failed operations"""
-        try:
-            self.cost_monitor.end_operation(operation_id, success=False)
-            self.timeout_manager.end_timeout(operation_id)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup operation {operation_id}: {e}")
-    
-    def create_metadata(self, operation_id: str, model_info: str, start_time: float) -> GenerationMetadata:
-        """Create metadata for responses"""
-        generation_time = time.time() - start_time
-        estimated_cost = generation_time * (self.config.cost_per_hour / 3600)
-        
-        return GenerationMetadata(
-            generation_time=generation_time,
-            model_info=model_info,
-            gpu_type=self.config.gpu_type.value,
-            estimated_cost=estimated_cost,
-            operation_id=operation_id
-        )
+    # All common service methods are now provided by ServiceMixin
     
     def validate_generation_request(self, request: CoverImageGenerationRequest):
         """Validate generation request parameters"""
@@ -361,16 +304,8 @@ class CoverImageGenServer:
     
     @modal.fastapi_endpoint(method="GET")
     def health_check(self) -> Dict[str, Any]:
-        """Health check endpoint"""
-        return {
-            "status": "healthy",
-            "service": self.config.service_name,
-            "model_loaded": getattr(self, '_model_loaded', False),
-            "gpu_type": self.config.gpu_type.value,
-            "scaledown_window": self.config.scaledown_window,
-            "max_runtime": self.config.max_runtime_seconds,
-            "timestamp": time.time()
-        }
+        """Health check endpoint - using mixin implementation"""
+        return super().health_check()
     
     @modal.fastapi_endpoint(method="GET")
     def service_info(self) -> Dict[str, Any]:

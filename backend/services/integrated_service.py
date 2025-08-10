@@ -24,7 +24,7 @@ from shared.models import (
 )
 from shared.deployment import base_image, music_gen_secrets
 from shared.config import settings
-from shared.base_service import create_service_app
+from shared.base_service import create_service_app, ServiceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +49,14 @@ if "gpu" in app_config:
 
 
 @app.cls(**app_config)
-class IntegratedMusicGenServer:
+class IntegratedMusicGenServer(ServiceMixin):
     """Integrated music generation server - orchestrates separate services like main.py"""
     
     @modal.enter()
     def load_model(self):
         """Initialize service (no model loading required)"""
-        from shared.monitoring import CostMonitor, TimeoutManager
-        from shared.storage import FileManager
-        
-        # Initialize service components (since we can't use __init__)
-        self.config = integration_config
-        self.cost_monitor = CostMonitor()
-        self.timeout_manager = TimeoutManager(integration_config.max_runtime_seconds)
-        self.file_manager = FileManager()
-        self._model_loaded = False
+        # Initialize service components using mixin
+        self.init_service_components(integration_config)
         self.service_urls = {
             "lyrics": settings.lyrics_service_url,
             "music": settings.music_service_url,
@@ -138,59 +131,7 @@ class IntegratedMusicGenServer:
             "max_runtime": self.config.max_runtime_seconds
         }
     
-    def validate_model_loaded(self):
-        """Validate that model is loaded"""
-        if not getattr(self, '_model_loaded', False):
-            raise RuntimeError("Model not loaded. Service temporarily unavailable.")
-    
-    def generate_operation_id(self) -> str:
-        """Generate unique operation ID"""
-        return str(uuid.uuid4())
-    
-    def start_operation(self, operation_id: str, operation_type: str = "generation"):
-        """Start monitoring for an operation"""
-        self.cost_monitor.start_operation(
-            operation_id, 
-            self.config.gpu_type.value, 
-            self.config.service_name,
-            {"operation_type": operation_type}
-        )
-        self.timeout_manager.start_timeout(
-            operation_id, 
-            self.config.max_runtime_seconds,
-            operation_type
-        )
-    
-    def end_operation(self, operation_id: str, success: bool = True):
-        """End monitoring for an operation"""
-        self.cost_monitor.end_operation(operation_id, success)
-        self.timeout_manager.end_timeout(operation_id)
-    
-    def check_timeout(self, operation_id: str) -> bool:
-        """Check if operation has timed out"""
-        return self.timeout_manager.check_timeout(operation_id)
-    
-    def cleanup_operation(self, operation_id: str):
-        """Clean up monitoring for failed operations"""
-        try:
-            self.cost_monitor.end_operation(operation_id, success=False)
-            self.timeout_manager.end_timeout(operation_id)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup operation {operation_id}: {e}")
-    
-    def create_metadata(self, operation_id: str, model_info: str, start_time: float):
-        """Create metadata for responses"""
-        from shared.models import GenerationMetadata
-        generation_time = time.time() - start_time
-        estimated_cost = generation_time * (self.config.cost_per_hour / 3600)
-        
-        return GenerationMetadata(
-            generation_time=generation_time,
-            model_info=model_info,
-            gpu_type=self.config.gpu_type.value,
-            estimated_cost=estimated_cost,
-            operation_id=operation_id
-        )
+    # All common service methods are now provided by ServiceMixin
     
     # API Endpoints - matching main.py endpoints
     @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
@@ -305,16 +246,8 @@ class IntegratedMusicGenServer:
     
     @modal.fastapi_endpoint(method="GET")
     def health_check(self) -> Dict[str, Any]:
-        """Health check endpoint"""
-        health = {
-            "status": "healthy",
-            "service": self.config.service_name,
-            "model_loaded": getattr(self, '_model_loaded', False),
-            "gpu_type": self.config.gpu_type.value,
-            "scaledown_window": self.config.scaledown_window,
-            "max_runtime": self.config.max_runtime_seconds,
-            "timestamp": time.time()
-        }
+        """Health check endpoint - using mixin implementation with service-specific additions"""
+        health = super().health_check()
         
         # Add service connectivity status
         health["dependent_services"] = {}
