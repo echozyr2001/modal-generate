@@ -22,11 +22,25 @@ from shared.models import (
     GPUType,
     GenerationMetadata
 )
+from pydantic import BaseModel, Field
+from typing import Optional
 from shared.deployment import image_generation_image, hf_volume, music_gen_secrets
 from shared.config import settings
 from shared.base_service import create_service_app, ServiceMixin
 
 logger = logging.getLogger(__name__)
+
+
+class CoverImageDirectDownloadResponse(BaseModel):
+    """Response for direct download mode with embedded file data"""
+    file_data: str = Field(..., description="Base64 encoded image data")
+    file_name: str = Field(..., description="Original filename")
+    file_size: int = Field(..., description="File size in bytes")
+    file_type: str = Field(..., description="File type (image)")
+    file_extension: str = Field(..., description="File extension")
+    image_dimensions: tuple = Field(..., description="Image dimensions (width, height)")
+    file_size_mb: float = Field(..., description="File size in MB")
+    metadata: GenerationMetadata
 
 # Get service configuration
 cover_image_config = ServiceConfig(
@@ -192,15 +206,20 @@ class CoverImageGenServer(ServiceMixin):
             temp_path = f"/tmp/{filename}"
             image.save(temp_path, "PNG")
             
-            # Save using FileManager
-            file_path = self.file_manager.save_file(temp_path, file_type="cover_images")
-            
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            
-            logger.info(f"Image saved to: {file_path}")
-            return file_path
+            # In direct download mode, return temp path for later processing
+            if self.file_manager.get_storage_mode() == "direct_download":
+                logger.info(f"Image prepared for direct download: {temp_path}")
+                return temp_path
+            else:
+                # Save using FileManager for S3/local storage
+                file_path = self.file_manager.save_file(temp_path, file_type="cover_images")
+                
+                # Clean up temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                
+                logger.info(f"Image saved to: {file_path}")
+                return file_path
             
         except Exception as e:
             logger.error(f"Failed to save image: {e}")
@@ -248,8 +267,8 @@ class CoverImageGenServer(ServiceMixin):
     
     # API Endpoints
     @modal.fastapi_endpoint(method="POST")
-    def generate_cover_image(self, request: CoverImageGenerationRequest) -> CoverImageGenerationResponse:
-        """Generate single cover image"""
+    def generate_cover_image(self, request: CoverImageGenerationRequest):
+        """Generate single cover image - returns different response based on storage mode"""
         operation_id = self.generate_operation_id()
         start_time = time.time()
         
@@ -275,15 +294,35 @@ class CoverImageGenServer(ServiceMixin):
             # Create metadata
             metadata = self.create_metadata(operation_id, f"SDXL-Turbo ({self.model_id})", start_time)
             
-            response = CoverImageGenerationResponse(
-                file_path=result["file_path"],
-                image_dimensions=result["image_dimensions"],
-                file_size_mb=result["file_size_mb"],
-                metadata=metadata
-            )
-            
-            logger.info(f"[{operation_id}] Cover image generated successfully")
-            return response
+            # Return different response based on storage mode
+            if self.file_manager.get_storage_mode() == "direct_download":
+                # Prepare file for direct download
+                download_data = self.file_manager.prepare_direct_download_response(result["file_path"])
+                
+                response = CoverImageDirectDownloadResponse(
+                    file_data=download_data["file_data"],
+                    file_name=download_data["file_name"],
+                    file_size=download_data["file_size"],
+                    file_type=download_data["file_type"],
+                    file_extension=download_data["file_extension"],
+                    image_dimensions=result["image_dimensions"],
+                    file_size_mb=result["file_size_mb"],
+                    metadata=metadata
+                )
+                
+                logger.info(f"[{operation_id}] Cover image prepared for direct download")
+                return response
+            else:
+                # Traditional response with file path
+                response = CoverImageGenerationResponse(
+                    file_path=result["file_path"],
+                    image_dimensions=result["image_dimensions"],
+                    file_size_mb=result["file_size_mb"],
+                    metadata=metadata
+                )
+                
+                logger.info(f"[{operation_id}] Cover image generated successfully")
+                return response
             
         except TimeoutError as e:
             self.cleanup_operation(operation_id)
@@ -302,61 +341,9 @@ class CoverImageGenServer(ServiceMixin):
             logger.error(f"[{operation_id}] Generation failed: {e}")
             raise HTTPException(status_code=500, detail="Image generation failed")
     
-    @modal.fastapi_endpoint(method="GET")
-    def health_check(self) -> Dict[str, Any]:
-        """Health check endpoint - using mixin implementation"""
-        return super().health_check()
+    # Health check removed to save endpoints - use generate endpoint for status
     
-    @modal.fastapi_endpoint(method="GET")
-    def service_info(self) -> Dict[str, Any]:
-        """Service information endpoint"""
-        return self.get_service_info()
-    
-    @modal.fastapi_endpoint(method="GET")
-    def get_available_styles(self) -> Dict[str, Any]:
-        """Get available style presets with descriptions"""
-        styles = {
-            style: {
-                "description": preset,
-                "best_for": self.get_style_recommendations().get(style, "General use")
-            }
-            for style, preset in self.get_style_presets().items()
-        }
-        
-        return {
-            "available_styles": styles,
-            "custom_style_supported": True,
-            "style_mixing_supported": True
-        }
-    
-    @modal.fastapi_endpoint(method="GET")
-    def download_image(self, file_path: str) -> Dict[str, Any]:
-        """Download image as base64 encoded data"""
-        try:
-            if not os.path.exists(file_path):
-                raise HTTPException(status_code=404, detail="Image file not found")
-            
-            # Read image and convert to base64
-            with open(file_path, "rb") as image_file:
-                image_data = image_file.read()
-                base64_data = base64.b64encode(image_data).decode('utf-8')
-            
-            # Get image info
-            with Image.open(file_path) as img:
-                width, height = img.size
-                format_type = img.format or "PNG"
-            
-            return {
-                "image_data": base64_data,
-                "format": format_type.lower(),
-                "width": width,
-                "height": height,
-                "file_size_bytes": len(image_data)
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to download image {file_path}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to download image")
+    # Endpoints merged to save quota
     
     def get_style_recommendations(self) -> Dict[str, str]:
         """Get style recommendations"""

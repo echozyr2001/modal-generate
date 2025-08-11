@@ -337,15 +337,9 @@ Living on the edge, never succumb.""",
             logger.error(f"[{operation_id}] Demo music generation failed: {e}")
             raise HTTPException(status_code=500, detail="Demo music generation failed")
     
-    @modal.fastapi_endpoint(method="GET")
-    def health_check(self) -> Dict[str, Any]:
-        """Health check endpoint - using mixin implementation"""
-        return super().health_check()
+    # Health check removed to save endpoints - use generate endpoints for status
     
-    @modal.fastapi_endpoint(method="GET")
-    def service_info(self) -> Dict[str, Any]:
-        """Service information endpoint"""
-        return self.get_service_info()
+    # Service info merged into health_check to save endpoints
 
 
 @app.local_entrypoint()

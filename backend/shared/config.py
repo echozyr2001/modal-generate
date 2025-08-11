@@ -15,8 +15,9 @@ class Settings(BaseSettings):
     default_inference_steps: int = 60  # Renamed from default_infer_steps
     
     # Storage configuration
+    storage_mode: str = os.environ.get("STORAGE_MODE", "direct_download")  # "s3", "local", "direct_download"
     use_s3_storage: bool = os.environ.get("USE_S3_STORAGE", "false").lower() == "true"
-    local_storage_dir: str = os.environ.get("LOCAL_STORAGE_DIR", "./outputs")
+    local_storage_dir: str = os.environ.get("LOCAL_STORAGE_DIR", "/tmp/music_outputs")
     s3_bucket_name: str = os.environ.get("S3_BUCKET_NAME", "")
     s3_region: Optional[str] = os.environ.get("S3_REGION")
     
@@ -45,11 +46,20 @@ class Settings(BaseSettings):
     
     def get_storage_config(self) -> dict:
         """Get current storage configuration"""
+        # Determine actual storage mode
+        if self.storage_mode == "direct_download":
+            actual_mode = "direct_download"
+        elif self.use_s3_storage:
+            actual_mode = "s3"
+        else:
+            actual_mode = "local"
+            
         return {
+            "storage_mode": actual_mode,
             "use_s3_storage": self.use_s3_storage,
             "s3_bucket_name": self.s3_bucket_name if self.use_s3_storage else None,
-            "local_storage_dir": self.local_storage_dir if not self.use_s3_storage else None,
-            "storage_mode": "s3" if self.use_s3_storage else "local"
+            "local_storage_dir": self.local_storage_dir if actual_mode in ["local", "direct_download"] else None,
+            "direct_download": actual_mode == "direct_download"
         }
     
     def get_service_config(self, service_name: str) -> Dict[str, Any]:

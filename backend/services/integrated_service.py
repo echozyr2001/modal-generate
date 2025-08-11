@@ -135,134 +135,79 @@ class IntegratedMusicGenServer(ServiceMixin):
     
     # API Endpoints - matching main.py endpoints
     @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
-    def generate_from_description(self, request: GenerateFromDescriptionRequest) -> GenerateMusicResponseS3:
+    def generate_music(self, request: dict) -> GenerateMusicResponseS3:
         """
-        Generate music from description - matches main.py endpoint
-        Orchestrates calls to separate services instead of doing everything in one place
+        Unified music generation endpoint - handles all generation types
+        Determines type based on request fields
         """
         operation_id = self.generate_operation_id()
         start_time = time.time()
         
-        logger.info(f"[{operation_id}] Full music generation from description: {request.full_described_song[:100]}...")
-        
-        # Start monitoring
-        self.start_operation(operation_id, "full_workflow_description")
-        
-        try:
-            # This would orchestrate calls to:
-            # 1. Lyrics service to generate prompt
-            # 2. Lyrics service to generate lyrics (if not instrumental)
-            # 3. Music service to generate audio
-            # 4. Image service to generate cover
-            # 5. Lyrics service to generate categories
+        # Determine request type based on fields
+        if "full_described_song" in request:
+            # Generate from description
+            req = GenerateFromDescriptionRequest(**request)
+            workflow_type = "full_workflow_description"
+            logger.info(f"[{operation_id}] Full music generation from description: {req.full_described_song[:100]}...")
             
-            # For now, call the internal method that matches main.py structure
             result = self.generate_and_upload_to_s3(
-                prompt="placeholder_prompt",  # Would come from lyrics service
-                lyrics="placeholder_lyrics" if not request.instrumental else "[instrumental]",
-                description_for_categorization=request.full_described_song,
-                **request.model_dump(exclude={"full_described_song"})
+                prompt="placeholder_prompt",
+                lyrics="placeholder_lyrics" if not req.instrumental else "[instrumental]",
+                description_for_categorization=req.full_described_song,
+                **req.model_dump(exclude={"full_described_song"})
             )
             
-            # End monitoring
-            self.end_operation(operation_id, success=True)
+        elif "lyrics" in request and request["lyrics"]:
+            # Generate with custom lyrics
+            req = GenerateWithCustomLyricsRequest(**request)
+            workflow_type = "full_workflow_custom_lyrics"
+            logger.info(f"[{operation_id}] Music generation with custom lyrics: {req.prompt[:100]}...")
             
-            logger.info(f"[{operation_id}] Full workflow from description completed successfully")
-            return result
-            
-        except Exception as e:
-            self.cleanup_operation(operation_id)
-            logger.error(f"[{operation_id}] Full workflow from description failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Workflow failed: {str(e)}")
-    
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
-    def generate_with_lyrics(self, request: GenerateWithCustomLyricsRequest) -> GenerateMusicResponseS3:
-        """
-        Generate music with custom lyrics - matches main.py endpoint
-        """
-        operation_id = self.generate_operation_id()
-        start_time = time.time()
-        
-        logger.info(f"[{operation_id}] Music generation with custom lyrics: {request.prompt[:100]}...")
-        
-        # Start monitoring
-        self.start_operation(operation_id, "full_workflow_custom_lyrics")
-        
-        try:
             result = self.generate_and_upload_to_s3(
-                prompt=request.prompt, 
-                lyrics=request.lyrics,
-                description_for_categorization=request.prompt, 
-                **request.model_dump(exclude={"prompt", "lyrics"})
+                prompt=req.prompt,
+                lyrics=req.lyrics,
+                description_for_categorization=req.prompt,
+                **req.model_dump(exclude={"prompt", "lyrics"})
             )
             
-            # End monitoring
-            self.end_operation(operation_id, success=True)
+        elif "described_lyrics" in request:
+            # Generate with described lyrics
+            req = GenerateWithDescribedLyricsRequest(**request)
+            workflow_type = "full_workflow_described_lyrics"
+            logger.info(f"[{operation_id}] Music generation with described lyrics: {req.prompt[:100]}...")
             
-            logger.info(f"[{operation_id}] Custom lyrics workflow completed successfully")
-            return result
-            
-        except Exception as e:
-            self.cleanup_operation(operation_id)
-            logger.error(f"[{operation_id}] Custom lyrics workflow failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Workflow failed: {str(e)}")
-    
-    @modal.fastapi_endpoint(method="POST", requires_proxy_auth=True)
-    def generate_with_described_lyrics(self, request: GenerateWithDescribedLyricsRequest) -> GenerateMusicResponseS3:
-        """
-        Generate music with described lyrics - matches main.py endpoint
-        """
-        operation_id = self.generate_operation_id()
-        start_time = time.time()
-        
-        logger.info(f"[{operation_id}] Music generation with described lyrics: {request.prompt[:100]}...")
-        
-        # Start monitoring
-        self.start_operation(operation_id, "full_workflow_described_lyrics")
-        
-        try:
-            # Generate lyrics if not instrumental (would call lyrics service)
             lyrics = ""
-            if not request.instrumental:
-                lyrics = "placeholder_generated_lyrics"  # Would come from lyrics service
+            if not req.instrumental:
+                lyrics = "placeholder_generated_lyrics"
             
             result = self.generate_and_upload_to_s3(
-                prompt=request.prompt, 
+                prompt=req.prompt,
                 lyrics=lyrics,
-                description_for_categorization=request.prompt, 
-                **request.model_dump(exclude={"described_lyrics", "prompt"})
+                description_for_categorization=req.prompt,
+                **req.model_dump(exclude={"described_lyrics", "prompt"})
             )
             
+        else:
+            raise HTTPException(status_code=400, detail="Invalid request format")
+        
+        # Start monitoring
+        self.start_operation(operation_id, workflow_type)
+        
+        try:
             # End monitoring
             self.end_operation(operation_id, success=True)
             
-            logger.info(f"[{operation_id}] Described lyrics workflow completed successfully")
+            logger.info(f"[{operation_id}] Music generation workflow completed successfully")
             return result
             
         except Exception as e:
             self.cleanup_operation(operation_id)
-            logger.error(f"[{operation_id}] Described lyrics workflow failed: {e}")
+            logger.error(f"[{operation_id}] Music generation workflow failed: {e}")
             raise HTTPException(status_code=500, detail=f"Workflow failed: {str(e)}")
     
-    @modal.fastapi_endpoint(method="GET")
-    def health_check(self) -> Dict[str, Any]:
-        """Health check endpoint - using mixin implementation with service-specific additions"""
-        health = super().health_check()
-        
-        # Add service connectivity status
-        health["dependent_services"] = {}
-        for service_name, url in self.service_urls.items():
-            health["dependent_services"][service_name] = {
-                "configured": bool(url),
-                "url": url if url else "not_configured"
-            }
-        
-        return health
+    # Health check removed to save endpoints - use generate endpoints for status
     
-    @modal.fastapi_endpoint(method="GET")
-    def service_info(self) -> Dict[str, Any]:
-        """Service information endpoint"""
-        return self.get_service_info()
+    # Service info merged into health_check to save endpoints
 
 
 @app.local_entrypoint()
